@@ -298,6 +298,10 @@ pub fn run(ctx: &Ctx) -> Result<()> {
 /// others.
 pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     memory.tick += 1;
+    // Renames first: a project that moves is ticked under its new slug.
+    for line in crate::rename::pending_pass(ctx) {
+        log.line(&line);
+    }
     let mut reachable = Vec::new();
     let mut unreachable = Vec::new();
     let mut sessions = Sessions::new(ctx);

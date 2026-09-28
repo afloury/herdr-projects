@@ -138,6 +138,9 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     if status != project::Status::Active {
         bail!("`{slug}` is {status}; `thread start` is refused until it is active again");
     }
+    if let Some(rename) = crate::rename::pending(&ctx.root, slug) {
+        bail!("`{slug}` is being renamed to `{}`; `thread start` is refused until its coordinator reopens there", rename.to);
+    }
     if args.title.trim().is_empty() {
         bail!("--title may not be empty");
     }
