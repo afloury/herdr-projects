@@ -96,6 +96,16 @@ enum Command {
         #[arg(long)]
         peek: bool,
     },
+    /// Who TASKS.md tasks may be assigned to: this project's thread profiles, and other machines with their profiles
+    Assignable {
+        slug: String,
+        /// Look up other machines' profiles again instead of using the hour-long cache
+        #[arg(long)]
+        refresh: bool,
+        /// Exit with an error unless OWNER (me, PROFILE, @MACHINE or PROFILE@MACHINE) is valid
+        #[arg(long, value_name = "OWNER")]
+        check: Option<String>,
+    },
     /// Print threads grouped by what needs you
     Overview {
         slug: Option<String>,
@@ -315,7 +325,7 @@ enum ThreadCommand {
         /// The task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: String,
-        /// Delegating this TASKS.md task (its title as written there): its notes are added to the task
+        /// Delegating this TASKS.md task (its title as written there): its notes are added to the task, and its owner gives --profile and --machine
         #[arg(long, value_name = "TITLE")]
         from_task: Option<String>,
     },
@@ -464,6 +474,13 @@ enum ProfileCommand {
     List {
         #[arg(long, value_name = "SLUG")]
         project: Option<String>,
+        /// Only the names, one per line (what other machines read to assign tasks here)
+        #[arg(long, conflicts_with = "project")]
+        names: bool,
+    },
+    /// Print a profile's launch setup here as JSON (default: [defaults] thread_profile); other machines read it to start threads here
+    Resolve {
+        name: Option<String>,
     },
     /// Add a profile (a person at a terminal only)
     Add {
@@ -553,7 +570,7 @@ enum TickerCommand {
 fn profile_change(ctx: &Ctx, command: ProfileCommand) -> Result<crate::profiles::Change> {
     use crate::profiles::{Change, Entry, Role};
     Ok(match command {
-        ProfileCommand::List { .. } => bail!("`profile list` changes nothing"),
+        ProfileCommand::List { .. } | ProfileCommand::Resolve { .. } => bail!("`profile list` and `profile resolve` change nothing"),
         ProfileCommand::Add { name, agent, fields } => Change::Add {
             name,
             entry: Entry { agent, model: fields.model.unwrap_or_default(), effort: fields.effort.unwrap_or_default(), args: fields.args, description: fields.description.unwrap_or_default() },
@@ -659,6 +676,7 @@ pub fn run() -> Result<()> {
             }
         },
         Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),
+        Command::Assignable { slug, refresh, check } => crate::assign::run(&ctx, &slug, refresh, check.as_deref()),
         Command::Overview { slug, wait } => overview::run(&ctx, slug.as_deref(), wait),
         Command::Focus { slug } => overview::focus(&ctx, slug.as_deref()),
         Command::Unfocus { session } => overview::unfocus(&ctx, &session.into()),
@@ -671,11 +689,19 @@ pub fn run() -> Result<()> {
             }
         },
         Command::Thread { command } => match command {
-            ThreadCommand::Start { slug, title, repo, machine, profile, kind, base, task_file, from_task } => {
+            ThreadCommand::Start { slug, title, repo, mut machine, mut profile, kind, base, task_file, from_task } => {
                 let mut task = read_text(&task_file)?;
                 if let Some(from) = from_task {
+                    // The task's owner picks the profile and machine.
                     let project = Project::load(&ctx.root, &slug)?;
-                    task = crate::tasks::delegated(&crate::tasks::read(&project.dir()), &from, &task)?;
+                    let tasks_md = crate::tasks::read(&project.dir());
+                    let found = crate::tasks::find(&tasks_md, &from)?;
+                    let config = crate::profiles::load(&ctx.config_dir)?;
+                    if found.owner.is_person(|p| config.get(p).is_some()) {
+                        bail!("\"{}\" belongs to {}, a person; people's tasks are never delegated. Change its owner in TASKS.md first if the user asks", found.title, found.owner);
+                    }
+                    (profile, machine) = crate::tasks::launch_for(&found, profile, machine)?;
+                    task = crate::tasks::delegated(&tasks_md, &from, &task)?;
                 }
                 let kind = kind.as_deref().map(crate::thread::Kind::parse).transpose()?;
                 let thread = threads::start(&ctx, &slug, StartArgs { title, repo, machine, profile, kind, base, task })?;
@@ -760,7 +786,18 @@ pub fn run() -> Result<()> {
         Command::Action { id } => actions::run_action(&ctx, &id),
         Command::Pane { id } => actions::run_pane(&ctx, &id),
         Command::Profile { command } => {
-            if let ProfileCommand::List { project } = command {
+            if let ProfileCommand::Resolve { name } = &command {
+                println!("{}", crate::profiles::resolve_json(&ctx, name.as_deref())?);
+                return Ok(());
+            }
+            if let ProfileCommand::List { project, names } = command {
+                if names {
+                    let config = crate::profiles::load(&ctx.config_dir)?;
+                    for p in config.listed(&crate::profiles::detect(ctx.env)) {
+                        println!("{}", p.name);
+                    }
+                    return Ok(());
+                }
                 let project = project.map(|slug| Project::load(&ctx.root, &slug)).transpose()?;
                 print!("{}", crate::profiles::list_text(&ctx, project.as_ref())?);
                 return Ok(());
