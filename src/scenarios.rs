@@ -2669,7 +2669,7 @@ fn a_remote_threads_profile_is_resolved_on_its_machine() {
 // ---------------------------------------------------------------- rename
 
 fn rename_args<'a>(from: &'a str, to: &'a str, name: Option<&'a str>, dry_run: bool) -> crate::rename::Args<'a> {
-    crate::rename::Args { from, to, name, dry_run }
+    crate::rename::Args { from, to, name, dry_run, by_ticker: false }
 }
 
 #[test]
@@ -2680,6 +2680,7 @@ fn rename_moves_the_folder_and_every_reference_to_it() {
     let old_s = old.to_string_lossy().into_owned();
     project.update_coordinator(|c| c.agent_session = "abc".into()).unwrap();
     std::fs::write(project.state_dir().join("coordinators.json"), "[]").unwrap();
+    // An unknown harness: its conversation cannot follow.
     // A resolved tab thread in the folder, a resolved worktree thread outside it, a remote one.
     let tab = world.thread(&project, &old.join("threads/t-0001"), |t| {
         t.kind = Kind::Tab;
@@ -2728,7 +2729,7 @@ fn rename_moves_the_folder_and_every_reference_to_it() {
     assert_eq!((t2.branch.as_str(), t2.worktree_path.as_str()), ("hp/scratch/t-0002-x", "/wt/x"));
     let c = home.coordinator().unwrap();
     assert_eq!(c.cwd, new_s);
-    assert!(c.pane_id.is_empty() && c.agent_session.is_empty() && c.workspace_id == "w1");
+    assert!(c.pane_id.is_empty() && c.agent_session == "abc" && c.workspace_id == "w1");
     assert!(!home.state_dir().join("coordinators.json").exists());
     // The user's config: the safety table and approvals follow the path.
     let config = std::fs::read_to_string(ctx.config_dir.join("config.toml")).unwrap();
@@ -2744,7 +2745,7 @@ fn rename_moves_the_folder_and_every_reference_to_it() {
     // What it could not update is listed, the remote thread by machine.
     let left = out.left.join("\n");
     assert!(left.contains("on box branch hp/scratch/t-0003-y, worktree /remote/wt"), "{left}");
-    assert!(left.contains("hp/scratch/t-0002-x") && left.contains("conversation"), "{left}");
+    assert!(left.contains("hp/scratch/t-0002-x") && left.contains("cannot resume"), "{left}");
     // `sweep` looks for both prefixes.
     assert_eq!(home.branch_prefixes(), ["hp/home/", "hp/scratch/"]);
     // A status change keeps the former slug.
@@ -2768,13 +2769,17 @@ fn rename_refuses_open_threads_live_agents_taken_and_bad_slugs() {
     assert!(refused("home").contains(&format!("not resolved: {}", t.id)));
     thread::update(&project, &t.id, |t| t.status = Status::Resolved).unwrap();
 
-    // Any agent in the folder, recorded or not.
+    // Any agent in the folder, recorded or not, hands it to the ticker.
     let dir = project.canonical_dir();
     *world.agents.borrow_mut() = format!("[{}]", agent_json("w9", "w9:t1", "w9:p3", &dir.join("scratch").to_string_lossy(), "stray", "idle"));
-    assert!(refused("home").contains("agent stray (pane w9:p3)"));
+    let plan = crate::rename::run(&ctx, &rename_args("demo", "home", None, true)).unwrap();
+    assert_eq!(plan.closing, ["agent stray (pane w9:p3)"]);
+    assert!(!plan.scheduled && crate::rename::pending(&world.root, "demo").is_none());
+    let by_ticker = crate::rename::Args { by_ticker: true, ..rename_args("demo", "home", None, false) };
+    assert!(crate::rename::run(&ctx, &by_ticker).unwrap_err().to_string().contains("agents still run"));
     *world.agents.borrow_mut() = "[]".into();
     *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
-    assert!(refused("home").contains("coordinator (pane w1:p1)"));
+    assert_eq!(crate::rename::run(&ctx, &rename_args("demo", "home", None, true)).unwrap().closing, ["coordinator (pane w1:p1)"]);
     *world.panes.borrow_mut() = "[]".into();
 
     // The dry run lists the plan and changes nothing.
@@ -2806,4 +2811,132 @@ fn rename_run_again_after_the_move_finishes_the_rest() {
     // Once finished, the old slug is simply gone.
     assert!(crate::rename::run(&ctx, &rename_args("demo", "demo-2", None, false)).is_ok());
     assert!(crate::rename::run(&ctx, &rename_args("demo", "x", None, false)).unwrap_err().to_string().contains("no project `demo`"));
+}
+
+fn claude_transcript(world: &World, dir: &Path, session: &str) -> PathBuf {
+    let encoded: String = dir.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    world.home.path().join(".claude/projects").join(encoded).join(format!("{session}.jsonl"))
+}
+
+#[test]
+fn a_coordinator_renames_its_own_project_and_reopens_in_the_new_folder() {
+    let world = World::new();
+    let project = world.project("scratch", "a.sock");
+    let old = project.canonical_dir();
+    project
+        .update_coordinator(|c| {
+            c.agent = "claude".into();
+            c.agent_session = "sess-7".into();
+        })
+        .unwrap();
+    let transcript = claude_transcript(&world, &old, "sess-7");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let coordinator = |state: &str| format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &old.to_string_lossy(), "hpc-scratch", state));
+    *world.agents.borrow_mut() = coordinator("working");
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    world.runner.on("pane close", ok(r#"{"result":{}}"#));
+    world.runner.on("workspace create", ok(r#"{"result":{"root_pane":{"workspace_id":"w4","tab_id":"w4:t1","pane_id":"w4:p1"}}}"#));
+    world.runner.on("tab rename", ok(r#"{"result":{}}"#));
+    world.runner.on("workspace rename", ok(r#"{"result":{}}"#));
+    world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w4:p1","tab_id":"w4:t1","workspace_id":"w4","name":"hpc-home","agent":"claude","agent_status":"idle","agent_session":{"value":"sess-7"}}}}"#));
+    let ctx = world.ctx();
+
+    // The coordinator runs the command itself: it is handed to the ticker.
+    let out = crate::rename::run(&ctx, &rename_args("scratch", "home", None, false)).unwrap();
+    assert!(out.scheduled && out.closing == ["coordinator (pane w1:p1)"], "{out:?}");
+    assert!(out.steps.last().unwrap().contains("resuming its conversation"), "{:?}", out.steps);
+    assert!(old.is_dir());
+    let pending = crate::rename::pending(&world.root, "scratch").unwrap();
+    assert!(pending.reopen && pending.to == "home");
+    let start = threads::start(&ctx, "scratch", StartArgs { title: "x".into(), repo: None, machine: None, profile: None, kind: None, base: None, task: "y".into() });
+    assert!(start.unwrap_err().to_string().contains("being renamed"));
+
+    // While it works (finishing its reply), nothing happens.
+    assert!(crate::rename::pending_pass(&ctx).is_empty());
+    assert_eq!(world.runner.count("pane close"), 0);
+    // Idle: its pane is closed; the move waits for the next pass.
+    *world.agents.borrow_mut() = coordinator("idle");
+    crate::rename::pending_pass(&ctx);
+    assert_eq!(world.runner.count("pane close w1:p1"), 1);
+    assert!(old.is_dir());
+    *world.agents.borrow_mut() = "[]".into();
+    *world.panes.borrow_mut() = "[]".into();
+    let log = crate::rename::pending_pass(&ctx).join("\n");
+    assert!(log.contains("renamed from `scratch` to `home`"), "{log}");
+
+    // Moved, reopened in the new folder resuming the conversation, told so.
+    assert!(!old.exists());
+    let home = Project::load(&world.root, "home").unwrap();
+    let new = home.canonical_dir();
+    assert!(claude_transcript(&world, &new, "sess-7").is_file() && transcript.is_file());
+    let calls = world.runner.calls.borrow();
+    let start = calls.iter().find(|c| c.display().contains("agent start")).expect("reopened");
+    assert!(start.display().contains("--resume sess-7"), "{}", start.display());
+    let create = calls.iter().find(|c| c.display().contains("workspace create")).unwrap();
+    assert!(create.display().contains(&*new.to_string_lossy()), "{}", create.display());
+    drop(calls);
+    let record = home.coordinator().unwrap();
+    assert_eq!((record.pane_id.as_str(), record.cwd.as_str()), ("w4:p1", &*new.to_string_lossy()));
+    let items = crate::inbox::unhandled(&home);
+    assert!(items.iter().any(|i| i.event == "project renamed" && i.summary.contains(&*new.to_string_lossy())), "{items:?}");
+    // Once the new coordinator is ready it gets the note, once.
+    assert_eq!(crate::rename::pending(&world.root, "scratch").unwrap().notify.unwrap().pane, "w4:p1");
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w4", "w4:t1", "w4:p1", &new.to_string_lossy(), "hpc-home", "idle"));
+    crate::rename::pending_pass(&ctx);
+    crate::rename::pending_pass(&ctx);
+    let calls = world.runner.calls.borrow();
+    let prompts: Vec<_> = calls.iter().filter(|c| c.display().contains("agent prompt w4:p1")).collect();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompt_text(prompts[0]).contains("renamed from `scratch` to `home`"), "{}", prompts[0].display());
+    drop(calls);
+    assert!(crate::rename::pending(&world.root, "scratch").is_none());
+}
+
+#[test]
+fn rename_finds_an_unreported_claude_conversation_by_its_folder() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    project.update_coordinator(|c| c.agent = "claude".into()).unwrap();
+    let old = project.canonical_dir();
+    for (id, age) in [("older", 60), ("newest", 0)] {
+        let file = claude_transcript(&world, &old, id);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "{}\n").unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(when).unwrap();
+    }
+    let ctx = world.ctx();
+    crate::rename::run(&ctx, &rename_args("demo", "home", None, false)).unwrap();
+    let home = Project::load(&world.root, "home").unwrap();
+    assert_eq!(home.coordinator().unwrap().agent_session, "newest");
+    assert!(claude_transcript(&world, &home.canonical_dir(), "newest").is_file());
+    assert!(!claude_transcript(&world, &home.canonical_dir(), "older").exists());
+}
+
+#[test]
+fn a_pending_rename_closes_a_busy_agent_after_the_wait_and_reports_a_failure() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir();
+    world.runner.on("pane close", ok(r#"{"result":{}}"#));
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w9", "w9:t1", "w9:p3", &dir.to_string_lossy(), "stray", "working"));
+    let ctx = world.ctx();
+    assert!(crate::rename::run(&ctx, &rename_args("demo", "home", None, false)).unwrap().scheduled);
+    // Still working past the wait: closed anyway.
+    let path = world.root.join(".renames/demo.json");
+    let mut pending = crate::rename::pending(&world.root, "demo").unwrap();
+    pending.requested = "2020-01-01T00:00:00Z".into();
+    project::write_json(&path, &pending).unwrap();
+    crate::rename::pending_pass(&ctx);
+    assert_eq!(world.runner.count("pane close w9:p3"), 1);
+
+    // A thread started meanwhile: the rename is dropped and the inbox says why.
+    *world.agents.borrow_mut() = "[]".into();
+    let t = world.thread(&project, Path::new("/wt/x"), |_| {});
+    let log = crate::rename::pending_pass(&ctx).join("\n");
+    assert!(log.contains("stopped") && log.contains(&t.id), "{log}");
+    assert!(!path.exists() && project.dir().is_dir());
+    assert!(crate::inbox::unhandled(&project).iter().any(|i| i.event == "rename failed"));
 }

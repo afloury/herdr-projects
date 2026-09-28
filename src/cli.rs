@@ -151,7 +151,9 @@ enum Command {
         force: bool,
     },
     /// Give a project a new slug (its folder name), and with --name a new display name.
-    /// Refused while a thread is not resolved or an agent runs in the project folder
+    /// Refused while a thread is not resolved. While agents run in the project folder
+    /// (its coordinator too) the ticker does it once they are idle: it closes their
+    /// panes, renames, and reopens the coordinator in the new folder
     Rename {
         slug: String,
         new_slug: String,
@@ -795,7 +797,7 @@ pub fn run() -> Result<()> {
         Command::Unarchive { slug } => lifecycle::set_status(&ctx, &slug, Status::Active),
         Command::Delete { slug, force } => lifecycle::delete(&ctx, &slug, force),
         Command::Rename { slug, new_slug, name, dry_run, session } => {
-            crate::rename::cli(&ctx, &crate::rename::Args { from: &slug, to: &new_slug, name: name.as_deref(), dry_run }, &session.into())
+            crate::rename::cli(&ctx, &crate::rename::Args { from: &slug, to: &new_slug, name: name.as_deref(), dry_run, by_ticker: false }, &session.into())
         }
         Command::AdoptWorkspace { name, goal, pane, workspace_cwd, session } => {
             adopt::adopt_workspace(&ctx, &adopt::AdoptWorkspace { name, goal, pane, workspace_cwd, session: session.into() })
