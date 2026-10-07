@@ -62,7 +62,7 @@ The thread automatically gets the project's name, goal, repos, instructions and 
 When the user says something about an area an open thread covers, choose intelligently, and you may do several of these:
 
 - **Check in**: read the thread's state (`hp thread show <slug> <id>`, its report at `threads/<id>.md`) and answer without prompting it.
-- **Prompt it**: `hp thread prompt <slug> <id> --text-file -` with the text on standard input. Every prompt is recorded in the thread's task file, so a restarted thread sees it.
+- **Prompt it**: `hp thread prompt <slug> <id> --text-file -` with the text on standard input. Every prompt is recorded in the thread's task file, so a restarted thread sees it. It is the only way to send a thread work: it says whether the agent started on it, so check its answer, and when it does not confirm the start, see `prompt_unconfirmed` below. Never send work with `thread keys`.
 - **Add or change a task** in `TASKS.md` (see Tasks).
 
 Use `hp thread restart <slug> <id>` when a thread's pane is gone or its start failed; `--profile <name>` restarts it on another allowed profile. Never hand-assemble `herdr` commands for starting, restarting, prompting, reading a pane or sending keys, and never call `herdr agent prompt`, `herdr agent read` or `herdr agent send-keys` directly: they would not target the project's session or the thread's machine.
@@ -103,7 +103,7 @@ A thread can stop on a screen that wants key presses: a "trust this folder?" dia
 
 1. `hp thread read <slug> <id>` prints what the pane shows (`--lines N` for more scrollback).
 2. Decide, by the rules below.
-3. `hp thread keys <slug> <id> <key>...` presses keys: `up`, `down`, `enter`, `esc`, `tab`, a digit or letter, `ctrl+c`. `--text "<text>"` types text first, without Enter (end with `enter` to submit it).
+3. `hp thread keys <slug> <id> <key>...` presses keys: `up`, `down`, `enter`, `esc`, `tab`, a digit or letter, `ctrl+c`. `--text "<text>"` types text first, without Enter (end with `enter` to submit it). Keys answer the screen; they never carry a new instruction (that goes through `thread prompt`), and `enter` at an input box only submits text `thread prompt` already typed (`prompt_unconfirmed`, below).
 4. `hp thread read` again to check that the screen moved on.
 
 What to answer:
@@ -117,7 +117,7 @@ What to answer:
 
 **A new thread that sits idle without its brief.** The ticker starts the agent on one pass and sends the brief once the agent has sat ready at an empty input box for a few seconds, and counts it sent only when the agent starts working on it, so a brief normally arrives within a minute of `thread start`; an agent idle at an empty prompt for a few seconds is still getting it. If the agent is still idle a minute after `thread start` and `thread prompt` says it has not received its brief, run `hp thread brief <slug> <id>`: it sends the brief now, never twice. If it says the pane shows a prompt, answer that first. After three tries that were not confirmed, the ticker stops and an inbox item says so: `thread read` shows the pane, then `thread brief`.
 
-**`thread prompt` says `prompt_unconfirmed`.** The text was typed but the agent was not seen starting on it. Do not send it again: `thread read` shows whether it sits in the input box, and `thread keys <slug> <id> enter` submits it.
+**`thread prompt` says `prompt_unconfirmed`.** The text was typed but the agent was not seen starting on it. Do not send it again: `thread read` shows whether it sits in the input box, and `thread keys <slug> <id> enter` submits it; `thread read` again to check that the turn started. `thread read` marks the box's dim text `[dim: …]`: a harness placeholder or suggested prompt (Claude Code's grey suggestions), not your text and not a draft, so never press `enter` on it. When the box holds only dim text, your text is not there: send it again with `thread prompt`.
 
 ## Memory and preferences
 
