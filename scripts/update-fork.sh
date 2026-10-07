@@ -37,6 +37,8 @@ lock() { if [ -n "${LOCK:-}" ]; then flock "$LOCK" "$@"; else "$@"; fi; }
 build=${BUILD:-}
 [ -n "$build" ] || { command -v cargo >/dev/null 2>&1 && build=cargo || build=docker; }
 echo "building $new with $build…"
+# Created here so the docker build (as root) leaves `target/` owned by the user.
+mkdir -p "$build_dir" "$(dirname "$bin")"
 case $build in
   cargo)
     CARGO_TARGET_DIR="$build_dir" lock nice -n 10 cargo build --release --locked
