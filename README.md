@@ -1,3 +1,5 @@
+> **This is a fork.** [afloury/herdr-projects](https://github.com/afloury/herdr-projects) is maintained from [eliasstravik/herdr-projects](https://github.com/eliasstravik/herdr-projects) (MIT, the original copyright and license kept in [LICENSE](LICENSE)) while upstream is paused. It adds fixes not yet merged upstream (omp input box, dim text in `thread read`, coordinator rules). Update it with `sh scripts/update-fork.sh`, not `herdr-projects update`, which installs upstream releases; see [Updating this fork](#updating-this-fork).
+
 <p align="center"><img src="https://img.shields.io/badge/Herdr%20Projects-Projects%20for%20Herdr-2ea44f?style=flat-square&labelColor=24292f" alt="Herdr Projects | Projects for Herdr" /></p>
 
 <h3 align="center">Run a whole project across your coding agents without handing each one its task or keeping track of who is doing what</h3>
@@ -88,6 +90,25 @@ herdr-projects update --check   # only print the installed and the newest versio
 ```
 
 `update` works for both install types and changes nothing when you're already on the newest release. Its `doctor --fix` also links the `autoproject` skill for each harness you configured, so existing users don't need to run `configure` again. A linked checkout must be on `main` with no uncommitted changes, or `update` stops and says why. When the install fails, the old version stays installed and the ticker is restarted. `doctor` says when a newer version is out.
+
+## Updating this fork
+
+`herdr-projects update` fetches upstream releases and would replace this fork's binary. Use the script instead, in the installed plugin folder (`herdr plugin list` shows it):
+
+```bash
+git remote add fork https://github.com/afloury/herdr-projects.git   # once
+sh scripts/update-fork.sh
+```
+
+It fetches the fork's `main`, checks it out detached, builds it with `cargo build --release` (in the `rust:1-alpine` Docker image when Cargo is not installed; `LOCK=/path/to/lock` runs the build under `flock`), stops the ticker with the old binary, swaps `target/release/herdr-projects`, runs `doctor --fix` and starts the ticker again. The folder must have no uncommitted changes.
+
+To bring in upstream changes, in a checkout of the fork:
+
+```bash
+git remote add upstream https://github.com/eliasstravik/herdr-projects.git   # once
+git fetch upstream && git checkout main && git merge upstream/main
+cargo test --locked && git push fork main
+```
 
 ## Get your questions answered
 
