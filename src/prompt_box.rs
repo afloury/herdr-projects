@@ -33,6 +33,8 @@ struct Cell {
     italic: bool,
     reverse: bool,
     bg: String,
+    /// Row and column on the screen.
+    at: (usize, usize),
 }
 
 type Line = Vec<Cell>;
@@ -72,7 +74,10 @@ fn parse(screen: &str) -> Vec<Line> {
             '\n' => lines.push(std::mem::take(&mut line)),
             '\r' => {}
             c if c.is_control() => {}
-            c => line.push(Cell { ch: c, dim: style.dim, italic: style.italic, reverse: style.reverse, bg: style.bg.clone() }),
+            c => {
+                let at = (lines.len(), line.len());
+                line.push(Cell { ch: c, dim: style.dim, italic: style.italic, reverse: style.reverse, bg: style.bg.clone(), at });
+            }
         }
     }
     if !line.is_empty() {
@@ -157,22 +162,16 @@ fn drop_hint(row: &mut Line) {
     row.truncate(start);
 }
 
+/// True when the cell at `i` is drawn by the harness rather than typed: dim
+/// text (a placeholder, a suggested prompt), or a cursor sitting on it.
+fn ghost(cells: &[Cell], i: usize) -> bool {
+    cells[i].dim || (cells[i].reverse && cells.get(i + 1).is_some_and(|next| next.dim))
+}
+
 /// The typed text in a box's cells: non-blank, not dim, and not a
 /// harness-drawn cursor sitting on a dim placeholder.
 fn typed(cells: &[Cell]) -> String {
-    let mut out = String::new();
-    for (i, c) in cells.iter().enumerate() {
-        if c.dim || c.ch.is_whitespace() {
-            out.push(' ');
-            continue;
-        }
-        if c.reverse && cells.get(i + 1).is_some_and(|next| next.dim) {
-            out.push(' ');
-            continue;
-        }
-        out.push(c.ch);
-    }
-    out
+    (0..cells.len()).map(|i| if cells[i].ch.is_whitespace() || ghost(cells, i) { ' ' } else { cells[i].ch }).collect()
 }
 
 /// The input box's cells, one entry per line, or `None` when it is not on
@@ -296,6 +295,54 @@ pub fn plain(screen: &str) -> String {
     parse(screen).iter().map(|line| text(line)).collect::<Vec<_>>().join("\n")
 }
 
+/// The screen as plain text for `thread read`, with the dim text in the input
+/// box (a placeholder or a suggested prompt, which Enter may submit) wrapped
+/// as `[dim: …]`, followed by a line saying what the box holds.
+pub fn read_view(kind: &str, screen: &str) -> String {
+    let lines = parse(screen);
+    let rows = input_box(kind, &lines);
+    let ghosts: std::collections::HashSet<(usize, usize)> = rows
+        .iter()
+        .flatten()
+        .flat_map(|row| (0..row.len()).filter(|&i| !row[i].ch.is_whitespace() && ghost(row, i)).map(|i| row[i].at))
+        .collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
+    for line in &lines {
+        let mut row = String::new();
+        let mut open = false;
+        for (i, c) in line.iter().enumerate() {
+            let is_ghost = ghosts.contains(&c.at);
+            if open && !is_ghost {
+                // Spaces inside a dim run stay inside it.
+                let next = line[i..].iter().find(|c| !c.ch.is_whitespace());
+                if !(c.ch.is_whitespace() && next.is_some_and(|n| ghosts.contains(&n.at))) {
+                    row.push(']');
+                    open = false;
+                }
+            } else if !open && is_ghost {
+                row.push_str("[dim: ");
+                open = true;
+            }
+            row.push(c.ch);
+        }
+        if open {
+            row.push(']');
+        }
+        out.push(row.trim_end().to_string());
+    }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    let mut view = out.join("\n");
+    let note = if ghosts.is_empty() { "" } else { "; the [dim: …] text is the harness's own placeholder or suggestion, not a draft" };
+    match rows.map(|_| box_text(kind, screen).unwrap_or_default()) {
+        Some(text) if text.is_empty() => view.push_str(&format!("\n--- input box: empty{note} ---")),
+        Some(text) => view.push_str(&format!("\n--- input box: holds typed text \"{text}\"{note} ---")),
+        None => {}
+    }
+    view
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +414,25 @@ mod tests {
         let rule = "─".repeat(40);
         assert_eq!(check("pi", &format!("{rule}\n\u{1b}[7mx\u{1b}[0m   \n{rule}\n")), Draft::Typed);
         assert_eq!(check("cursor", "  \u{1b}[2m→ \u{1b}[0m\u{1b}[7mP\u{1b}[0m\u{1b}[2mlan, search\u{1b}[0m\n"), Draft::Empty);
+    }
+
+    #[test]
+    fn read_view_marks_a_suggested_prompt_so_it_is_not_taken_for_a_draft() {
+        // Claude's suggested prompt: a cursor on its first letter, the rest dim.
+        let view = read_view("claude", &fixture("claude-suggestion"));
+        assert!(view.contains("[dim: run the tests again]"), "{view}");
+        assert!(view.ends_with("--- input box: empty; the [dim: …] text is the harness's own placeholder or suggestion, not a draft ---"), "{view}");
+        // A typed draft stays as it is, and is reported as typed.
+        let view = read_view("claude", &fixture("claude-draft"));
+        assert!(!view.contains("[dim:"), "{view}");
+        assert!(view.lines().last().unwrap().starts_with("--- input box: holds typed text \""), "{view}");
+        // Typed text then a dim completion: only the completion is marked.
+        let rule = "─".repeat(40);
+        let view = read_view("claude", &format!("{rule}\n❯ fix \u{1b}[2mthe build\u{1b}[0m\n{rule}\n"));
+        assert!(view.contains("❯ fix [dim: the build]"), "{view}");
+        assert!(view.ends_with("--- input box: holds typed text \"fix\"; the [dim: …] text is the harness's own placeholder or suggestion, not a draft ---"), "{view}");
+        // Dim text outside the box is left alone, and no box means no box line.
+        let view = read_view("claude", "\u{1b}[2mstatus line\u{1b}[0m\n");
+        assert_eq!(view, "status line");
     }
 }

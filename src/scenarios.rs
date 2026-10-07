@@ -2442,7 +2442,7 @@ fn thread_read_and_keys_reach_the_threads_pane_on_its_session_and_refuse_a_bare_
     {
         let calls = world.runner.calls.borrow();
         let reads: Vec<&Cmd> = calls.iter().filter(|c| c.display().contains("agent read")).collect();
-        assert_eq!(reads[0].args, ["agent", "read", "w2:p1", "--format", "text", "--source", "visible"]);
+        assert_eq!(reads[0].args, ["agent", "read", "w2:p1", "--format", "ansi", "--source", "visible"]);
         assert_eq!(reads[1].args[5..], ["--source", "recent", "--lines", "40"]);
         assert!(socket_of(reads[0]).ends_with("a.sock"));
         // Text goes first, then the keys, both to the thread's pane.
