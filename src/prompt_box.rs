@@ -238,13 +238,22 @@ fn input_box(kind: &str, lines: &[Line]) -> Option<Vec<Line>> {
             Some(lines[top + 1..bottom].to_vec())
         }
         // `╰─ ` under the status line, then the editor's continuation lines
-        // and any menu it opened, down to the bottom of the screen.
+        // and any menu it opened, down to the bottom of the screen. Other
+        // omp layouts draw the editor as `▎` lines with only the status bar
+        // below them.
         "omp" => {
-            let at = last(&|_, l| {
+            let Some(at) = last(&|_, l| {
                 let t = text(l);
                 let t = t.trim_end();
                 t == "╰─" || t.starts_with("╰─ ")
-            })?;
+            }) else {
+                let bottom = last(&|_, l| trimmed_starts(l, "▎"))?;
+                if lines[bottom + 1..].iter().filter(|l| !text(l).trim().is_empty()).count() > 1 {
+                    return None;
+                }
+                let top = (0..=bottom).rev().take_while(|&i| trimmed_starts(&lines[i], "▎")).last()?;
+                return Some(lines[top..=bottom].iter().map(|line| after(line, '▎').unwrap_or_default()).collect());
+            };
             let mut first = after(&lines[at], '─')?;
             drop_hint(&mut first);
             let mut rows = vec![first];
@@ -323,6 +332,10 @@ mod tests {
         // A hint with another key or label is dropped too.
         let hint = "╰─ \u{1b}[38;2;0;180;255m←\u{1b}[0m \u{1b}[3mto see 2 running agents\u{1b}[0m\n";
         assert_eq!(check("omp", hint), Draft::Empty);
+        // The `▎` editor layout, with only the status bar under it.
+        assert_eq!(check("omp", &fixture("omp-bar-empty")), Draft::Empty);
+        assert_eq!(box_text("omp", &fixture("omp-bar-draft")).as_deref(), Some("fix the failing checks"));
+        assert_eq!(check("omp", "▎ quoted reply\nmore transcript\n╭─ menu\n"), Draft::Unknown);
     }
 
     #[test]
