@@ -817,7 +817,7 @@ mod tests {
     }
 
     fn memory() -> Memory {
-        Memory { started: jiff::Timestamp::now(), gh: Outage::default(), gh_login: None, outage_secs: DEFAULT_OUTAGE_SECS, tick: 0, machines: BTreeMap::new(), grouping: Default::default() }
+        Memory { started: jiff::Timestamp::now(), gh: Outage::default(), gh_login: None, outage_secs: DEFAULT_OUTAGE_SECS, recover_secs: DEFAULT_RECOVER_SECS, tick: 0, machines: BTreeMap::new(), grouping: Default::default() }
     }
 
     #[test]
