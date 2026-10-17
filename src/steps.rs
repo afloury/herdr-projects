@@ -463,6 +463,12 @@ pub fn pr_routine_prompt(name: &str, body: &str, url: &str, events: &[&str], sum
     format!("[hp routine {name}] Your pull request {url} changed: {}.\n\n{}", facts.join("; "), body.trim())
 }
 
+/// Whether a pull request changed only by its head commit (a push): no event,
+/// so no item. Failing checks that went away are a change and keep their item.
+pub fn only_head_moved(old: &pr::Summary, new: &pr::Summary) -> bool {
+    old.head_oid != new.head_oid && *old == pr::Summary { head_oid: old.head_oid.clone(), ..new.clone() }
+}
+
 pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &mut Memory, now: jiff::Timestamp) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
     let notifier = crate::notify::Notifier::new(ctx, project);
@@ -535,6 +541,11 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
             Ok(pr::Checked::Summary(summary)) => {
                 let old = state.prs.get(&t.id).cloned();
                 if old.as_ref() == Some(&summary) {
+                    continue;
+                }
+                // The thread pushed and nothing else changed: remembered, no item.
+                if old.as_ref().is_some_and(|o| only_head_moved(o, &summary)) {
+                    state.prs.insert(t.id.clone(), summary);
                     continue;
                 }
                 let (pr_state, pr_review) = (summary.state.clone(), summary.review_decision.clone());
@@ -847,6 +858,20 @@ mod tests {
         let prompt = pr_routine_prompt("pr-followup", "Fix it.", "https://github.com/o/r/pull/4", &["checks-failed"], &failing);
         assert_eq!(prompt, "[hp routine pr-followup] Your pull request https://github.com/o/r/pull/4 changed: 1 check(s) fail (`gh pr checks https://github.com/o/r/pull/4`).\n\nFix it.");
         assert!(!prompt.contains("lint"), "check names are GitHub text and never reach a prompt");
+    }
+
+    #[test]
+    fn a_push_alone_changes_only_the_head_commit() {
+        let open = pr::Summary { state: "OPEN".into(), head_oid: "aaa".into(), ..pr::Summary::default() };
+        let pushed = pr::Summary { head_oid: "bbb".into(), ..open.clone() };
+        assert!(only_head_moved(&open, &pushed));
+        assert!(pr_events(Some(&open), &pushed, Some("me")).is_empty());
+        assert!(!only_head_moved(&open, &open), "no change at all is not a push");
+        let failing = pr::Summary { failing_checks: vec!["lint".into()], ..open.clone() };
+        let fixed = pr::Summary { head_oid: "bbb".into(), ..open.clone() };
+        assert!(!only_head_moved(&failing, &fixed), "failing checks that went away keep their item");
+        let commented = pr::Summary { head_oid: "bbb".into(), comment_count: 1, ..open.clone() };
+        assert!(!only_head_moved(&open, &commented));
     }
 
     #[test]
