@@ -150,7 +150,7 @@ fn step(project: &Project, herdr: &Herdr, t: &mut Thread, agent: &Agent, sender:
                         return Ok(Outcome::Delivered);
                     }
                 } else {
-                    return Ok(give_up(project, t, "its input box cannot be read to check an earlier try")?);
+                    return give_up(project, t, "its input box cannot be read to check an earlier try");
                 }
             }
             _ => return Ok(Outcome::Waiting(format!("the agent is {state} and an earlier try may still be in its input box"))),

@@ -717,6 +717,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
 /// `agent start` per machine per tick (`may_start`), and never a start and a
 /// prompt for the same pane in one tick: prompts only go to agents that were
 /// already listed before any start.
+#[allow(clippy::too_many_arguments)]
 fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], may_start: &mut bool, errors: &mut Vec<anyhow::Error>) {
     let now = jiff::Timestamp::now();
     for t in threads {

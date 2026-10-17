@@ -675,7 +675,7 @@ mod tests {
         // A user edit made after configure survives unconfigure.
         configure(&ctx, &options).unwrap();
         let text = std::fs::read_to_string(claude.join("settings.json")).unwrap();
-        std::fs::write(claude.join("settings.json"), text.replace("\"theme\"", "\"theme\"").replacen("{\n", "{\n  \"model\": \"opus\",\n", 1)).unwrap();
+        std::fs::write(claude.join("settings.json"), text.replacen("{\n", "{\n  \"model\": \"opus\",\n", 1)).unwrap();
         unconfigure(&ctx).unwrap();
         let after = std::fs::read_to_string(claude.join("settings.json")).unwrap();
         assert!(after.contains("\"model\": \"opus\"") && after.contains("say done") && !after.contains("herdr-projects"));

@@ -309,7 +309,7 @@ pub fn show_text(ctx: &Ctx, target: &Target) -> Result<String> {
     if let Target::Project(project) = target {
         let safety = project.safety(&ctx.config_dir)?;
         let config = crate::profiles::load(&ctx.config_dir)?;
-        out.push_str("\n");
+        out.push('\n');
         for role in [crate::profiles::Role::Thread, crate::profiles::Role::Coordinator] {
             let list = config.allowed(&safety, role).map(|l| if l.is_empty() { "none".to_string() } else { l.join(", ") }).unwrap_or_else(|| "every profile".into());
             out.push_str(&format!("  {:<24} {list}\n", role.list_key()));
