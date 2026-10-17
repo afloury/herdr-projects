@@ -39,18 +39,20 @@ pub fn current_prefix(root: &Path) -> Result<String> {
 }
 
 /// True when `pane` is the pane the record describes: same workspace, tab and
-/// working directory. Ids are only unique within one server, so callers only
-/// ever compare panes listed through the project's recorded socket.
+/// working directory (see `herdr::own_dir`). Ids are only unique within one
+/// server, so callers only ever compare panes listed through the project's
+/// recorded socket.
 pub fn pane_matches(record: &Coordinator, pane: &Pane) -> bool {
     pane.pane_id == record.pane_id
         && pane.workspace_id == record.workspace_id
         && pane.tab_id == record.tab_id
-        && (pane.cwd == record.cwd || pane.foreground_cwd == record.cwd)
+        && crate::herdr::own_dir(&pane.cwd, &pane.foreground_cwd) == record.cwd
 }
 
 /// A coordinator of the project: any agent whose working directory is the
 /// project home (the canonical path the record stores), including one `open`
-/// started in a shell pane elsewhere.
+/// started in a shell pane elsewhere. A pane has one such directory, so it is
+/// the coordinator of one project at most.
 pub fn is_coordinator(record: &Coordinator, agent: &Agent) -> bool {
     agent.works_in(&record.cwd)
 }
@@ -666,6 +668,24 @@ mod tests {
         // `open` ran it in a shell pane elsewhere: its own directory counts.
         let child = Agent { foreground_cwd: "/r/demo".into(), ..agent("w5:p1", "/tmp", "idle", 1) };
         assert!(is_coordinator(&record, &child));
+        // ...and only its own: a shell in this project's home running another
+        // project's coordinator is that project's (#97).
+        let other = Agent { foreground_cwd: "/r/alpha".into(), ..agent("w6:p1", "/r/demo", "working", 9) };
+        assert!(!is_coordinator(&record, &other));
+        assert!(is_coordinator(&Coordinator { cwd: "/r/alpha".into(), ..Coordinator::default() }, &other));
+        // The agent is the shell's foreground process: both directories agree.
+        let plain = Agent { foreground_cwd: "/r/demo".into(), ..agent("w7:p1", "/r/demo", "idle", 1) };
+        assert!(is_coordinator(&record, &plain));
+    }
+
+    #[test]
+    fn a_recorded_pane_is_matched_by_its_agent_s_own_directory() {
+        let record = Coordinator { cwd: "/r/demo".into(), workspace_id: "w1".into(), tab_id: "w1:t1".into(), pane_id: "w1:p1".into(), ..Coordinator::default() };
+        let pane = |cwd: &str, foreground_cwd: &str| Pane { pane_id: "w1:p1".into(), tab_id: "w1:t1".into(), workspace_id: "w1".into(), cwd: cwd.into(), foreground_cwd: foreground_cwd.into(), ..Pane::default() };
+        assert!(pane_matches(&record, &pane("/r/demo", "")));
+        assert!(pane_matches(&record, &pane("/r/demo", "/r/demo")));
+        assert!(pane_matches(&record, &pane("/tmp", "/r/demo")));
+        assert!(!pane_matches(&record, &pane("/r/demo", "/r/alpha")));
     }
 
     #[test]
