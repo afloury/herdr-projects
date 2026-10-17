@@ -1644,6 +1644,60 @@ fn local_threads_and_each_due_machine_get_one_agent_start_per_tick() {
 }
 
 #[test]
+fn every_project_sharing_a_machine_is_polled_in_its_due_tick() {
+    let (world, demo) = remote_world();
+    let world = World { runner: FakeRunner::new(), ..world };
+    let home = world.home.path().to_string_lossy().into_owned();
+    // A second project whose only thread waits to launch on the same "box".
+    let other = world.project("other", "a.sock");
+    let waiting = thread::allocate(&other, |t| {
+        t.status = Status::Open;
+        t.kind = Kind::Tab;
+        t.prompt_pending = true;
+        t.machine = "box".into();
+        t.agent = "claude".into();
+        t.agent_name = thread::agent_name(&other.slug, &t.id);
+        t.workspace_id = "w3".into();
+        t.tab_id = "w3:t2".into();
+        t.pane_id = "w3:p2".into();
+        t.cwd = home.clone();
+    })
+    .unwrap();
+    let local_panes = format!(r#"{{"result":{{"panes":[{},{}]}}}}"#, world.coordinator_pane(&demo), world.coordinator_pane(&other));
+    let remote_panes = format!(r#"{{"result":{{"panes":[{},{}]}}}}"#, pane_json("w2", "w2:t1", "w2:p1", "/home/me/wt"), pane_json("w3", "w3:t2", "w3:p2", &home));
+    world.runner.on("machine list --json", ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#));
+    world.runner.on_fn(|c| is_machine_call(c) && c.display().contains("agent list"), |_| Ok(ok(r#"{"result":{"agents":[]}}"#)));
+    world.runner.on_fn(|c| is_machine_call(c) && c.display().contains("pane list"), move |_| Ok(ok(&remote_panes)));
+    world.runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+    world.runner.on("pane list", ok(&local_panes));
+    world.runner.on("ssh", ok(""));
+    world.runner.on("report-metadata", ok(r#"{"result":{}}"#));
+    world.runner.on_fn(
+        |c| c.display().contains("agent start"),
+        |_| Ok(ok(r#"{"result":{"agent":{"pane_id":"w3:p2","tab_id":"w3:t2","workspace_id":"w3"}}}"#)),
+    );
+
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    let remote_polls = |w: &World| w.runner.calls.borrow().iter().filter(|c| is_machine_call(c) && c.display().contains("agent list")).count();
+    memory.tick = 1;
+    for project in [&demo, &other] {
+        ticker::tick_project_with(&ctx, project, &mut memory).unwrap();
+    }
+    // The first project asked does not use up the machine's turn.
+    assert_eq!(remote_polls(&world), 2);
+    assert_eq!(thread::load(&other, &waiting.id).unwrap().launch_attempts, 1);
+    // The poll rhythm stays per machine: neither is polled again for three ticks.
+    for tick in 2..=4 {
+        memory.tick = tick;
+        for project in [&demo, &other] {
+            ticker::tick_project_with(&ctx, project, &mut memory).unwrap();
+        }
+    }
+    assert_eq!(remote_polls(&world), 2);
+}
+
+#[test]
 fn a_failed_machine_call_changes_nothing_and_the_machine_is_skipped_for_eight_ticks() {
     let (world, project) = remote_world();
     let failing = World { runner: FakeRunner::new(), ..world };
@@ -1858,7 +1912,7 @@ fn open_starts_a_coordinator_without_a_priming_prompt_then_focuses_it_and_resume
     *world.panes.borrow_mut() = "[]".into();
     crate::coordinator::open(&ctx, "demo", &options(false)).unwrap();
     let calls = world.runner.calls.borrow();
-    let start = calls.iter().filter(|c| c.display().contains("agent start")).last().unwrap();
+    let start = calls.iter().rfind(|c| c.display().contains("agent start")).unwrap();
     assert!(start.args.ends_with(&["--".to_string(), "--resume".to_string(), "sess-42".to_string()]), "{}", start.display());
     drop(calls);
 
@@ -1869,7 +1923,7 @@ fn open_starts_a_coordinator_without_a_priming_prompt_then_focuses_it_and_resume
     let another = crate::coordinator::OpenOptions { profile: Some("codex".into()), ..options(true) };
     crate::coordinator::open(&ctx, "demo", &another).unwrap();
     let calls = world.runner.calls.borrow();
-    let start = calls.iter().filter(|c| c.display().contains("agent start")).last().unwrap();
+    let start = calls.iter().rfind(|c| c.display().contains("agent start")).unwrap();
     assert!(start.display().starts_with("herdr agent start hpc-demo-1 --kind codex --pane w3:p2"), "{}", start.display());
     assert!(!start.display().contains("sess-42"));
     drop(calls);
@@ -1906,7 +1960,7 @@ fn open_new_starts_a_fresh_coordinator_beside_a_live_one_without_its_session() {
     world.runner.on("--pane w3:p2", ok(r#"{"result":{"agent":{"pane_id":"w3:p2","tab_id":"w3:t2","workspace_id":"w3","name":"hpc-demo-1","agent":"claude","agent_status":"idle"}}}"#));
     crate::coordinator::open(&ctx, "demo", &options(true)).unwrap();
     let calls = world.runner.calls.borrow();
-    let start = calls.iter().filter(|c| c.display().contains("agent start")).last().unwrap();
+    let start = calls.iter().rfind(|c| c.display().contains("agent start")).unwrap();
     assert!(start.display().starts_with("herdr agent start hpc-demo-1 --kind claude --pane w3:p2"), "{}", start.display());
     assert!(!start.display().contains("--resume") && !start.display().contains("sess-42"), "{}", start.display());
     drop(calls);
@@ -2012,7 +2066,7 @@ fn a_tab_thread_gets_a_brief_with_the_project_header_and_prompts_are_recorded() 
     std::fs::write(thread::home_report_path(&project, "t-0001"), "## Report\nok\n## Next\n- Open the PR\n").unwrap();
     threads::next(&ctx, "demo", "t-0001", Some(1), None).unwrap();
     let calls = world.runner.calls.borrow();
-    let last = calls.iter().filter(|c| c.display().contains("agent prompt")).last().unwrap();
+    let last = calls.iter().rfind(|c| c.display().contains("agent prompt")).unwrap();
     assert_eq!(prompt_text(last), "Open the PR");
     drop(calls);
     assert!(threads::next(&ctx, "demo", "t-0001", Some(3), None).is_err());
@@ -2194,6 +2248,7 @@ fn open_makes_a_tab_outside_a_shell_pane_from_the_popup_with_tab_or_from_an_agen
     let socket = |h: &Here| h.socket.to_string_lossy().into_owned();
     // Not inside Herdr, --tab, the popup (a plugin pane), another session's
     // pane, and a pane an agent occupies: all make a tab and run nothing here.
+    #[allow(clippy::type_complexity)]
     let cases: Vec<(&str, Box<dyn Fn(&Here) -> (Env, bool)>)> = vec![
         ("outside herdr", Box::new(|h| (Env::for_test(h.world.home.path(), &[]), true))),
         ("--tab", Box::new(|h| (h.world.env.clone(), false))),
@@ -2225,7 +2280,7 @@ fn a_tab_thread_of_a_coordinator_running_in_another_workspace_opens_the_project_
     let args = |title: &str| StartArgs { title: title.into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() };
     let t = threads::start(&h.world.ctx(), "demo", args("Research")).unwrap();
     let calls = h.world.runner.calls.borrow();
-    let create = calls.iter().filter(|c| c.display().contains("workspace create")).last().unwrap();
+    let create = calls.iter().rfind(|c| c.display().contains("workspace create")).unwrap();
     assert!(create.display().contains("threads/t-0001") && create.args.contains(&"Demo\u{2800}".to_string()), "{}", create.display());
     drop(calls);
     // (`Here` scripts every new workspace as w3.)
@@ -2939,4 +2994,38 @@ fn a_pending_rename_closes_a_busy_agent_after_the_wait_and_reports_a_failure() {
     assert!(log.contains("stopped") && log.contains(&t.id), "{log}");
     assert!(!path.exists() && project.dir().is_dir());
     assert!(crate::inbox::unhandled(&project).iter().any(|i| i.event == "rename failed"));
+}
+
+#[test]
+fn coordinator_prompt_reaches_its_own_project_s_coordinator_not_one_whose_shell_sits_in_its_folder() {
+    // #97: alpha's coordinator was started from a shell in beta's home.
+    let world = World::new();
+    let alpha = world.project("alpha", "a.sock");
+    let beta = world.project("beta", "a.sock");
+    let home = |p: &Project| p.canonical_dir().to_string_lossy().into_owned();
+    let agent = |pane: &str, cwd: &str, foreground_cwd: &str, name: &str, state: &str, seq: u64| {
+        let (workspace, _) = pane.split_once(':').unwrap();
+        format!(
+            r#"{{"pane_id":"{pane}","tab_id":"{workspace}:t1","workspace_id":"{workspace}","cwd":"{cwd}","foreground_cwd":"{foreground_cwd}","name":"{name}","agent":"claude","agent_status":"{state}","state_change_seq":{seq}}}"#
+        )
+    };
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent("wW:p1", &home(&beta), &home(&alpha), "hpc-alpha", "working", 9),
+        agent("wH:p1", "/code/beta", &home(&beta), "hpc-beta", "done", 3)
+    );
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+    coordinator::prompt(&ctx, "beta", "Merge the open PRs.").unwrap();
+    coordinator::prompt(&ctx, "alpha", "Status?").unwrap();
+    let calls = world.runner.calls.borrow();
+    let sent: Vec<(String, String)> = calls
+        .iter()
+        .filter(|c| c.display().contains("agent prompt"))
+        .map(|c| {
+            let at = c.args.iter().position(|a| a == "prompt").unwrap();
+            (c.args[at + 1].clone(), prompt_text(c).to_string())
+        })
+        .collect();
+    assert_eq!(sent, [("wH:p1".to_string(), "Merge the open PRs.".to_string()), ("wW:p1".to_string(), "Status?".to_string())]);
 }

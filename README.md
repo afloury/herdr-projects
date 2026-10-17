@@ -2,6 +2,9 @@
 
 <p align="center"><img src="https://img.shields.io/badge/Herdr%20Projects-Projects%20for%20Herdr-2ea44f?style=flat-square&labelColor=24292f" alt="Herdr Projects | Projects for Herdr" /></p>
 
+> [!NOTE]
+> **0.2.35 is the last release of the Rust version of Herdr Projects.** A rewritten herdr-projects is coming as the next release. If you want to keep the Rust version, fork it from the [`legacy`](https://github.com/eliasstravik/herdr-projects/tree/legacy) branch or the [`v0.2.35`](https://github.com/eliasstravik/herdr-projects/releases/tag/v0.2.35) tag.
+
 <h3 align="center">Run a whole project across your coding agents without handing each one its task or keeping track of who is doing what</h3>
 
 <p align="center">Herdr Projects lets you run a larger piece of work in <a href="https://herdr.dev">Herdr</a> when one agent isn't enough and managing five by hand is a job in itself. You talk to one coordinator agent. It starts a separate agent for each task on its own branch, gives every one of them the same goal, instructions and memory, and Herdr's own sidebar shows you which threads need you, which are ready for review and which are still working.</p>
