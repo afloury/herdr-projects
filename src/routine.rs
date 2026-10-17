@@ -22,7 +22,14 @@ pub enum Schedule {
     Every(i64),
     /// `daily HH:MM`, local time.
     Daily(i8, i8),
+    /// `weekly <days> HH:MM[,HH:MM…]` (or `daily` with several times), local
+    /// time: `days` has bit 0 for Monday to bit 6 for Sunday, `times` is sorted.
+    Weekly { days: u8, times: Vec<(i8, i8)> },
 }
+
+const DAY_NAMES: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+const EVERY_DAY: u8 = 0b111_1111;
+const FORMATS: &str = "use `every <N>m|h|d`, `daily HH:MM[,HH:MM…]` or `weekly <days> HH:MM[,HH:MM…]` (days: `mon,wed,fri` or `mon-fri`)";
 
 pub fn parse_schedule(text: &str) -> Result<Schedule> {
     let text = text.trim();
@@ -39,52 +46,112 @@ pub fn parse_schedule(text: &str) -> Result<Schedule> {
         return Ok(Schedule::Every(n * seconds));
     }
     if let Some(rest) = text.strip_prefix("daily ") {
-        let (h, m) = rest.trim().split_once(':').with_context(|| format!("bad schedule `{text}`"))?;
+        let times = parse_times(rest.trim()).with_context(|| format!("bad schedule `{text}`"))?;
+        return Ok(match times.as_slice() {
+            [(h, m)] => Schedule::Daily(*h, *m),
+            _ => Schedule::Weekly { days: EVERY_DAY, times },
+        });
+    }
+    if let Some(rest) = text.strip_prefix("weekly ") {
+        let (days, times) = rest.trim().split_once(char::is_whitespace).with_context(|| format!("bad schedule `{text}`: {FORMATS}"))?;
+        let days = parse_days(days).with_context(|| format!("bad schedule `{text}`"))?;
+        let times = parse_times(times.trim()).with_context(|| format!("bad schedule `{text}`"))?;
+        return Ok(Schedule::Weekly { days, times });
+    }
+    bail!("bad schedule `{text}`: {FORMATS}")
+}
+
+/// `HH:MM` or `HH:MM,HH:MM…`, sorted and without repeats.
+fn parse_times(text: &str) -> Result<Vec<(i8, i8)>> {
+    let mut times = Vec::new();
+    for part in text.split(',') {
+        let (h, m) = part.trim().split_once(':').context("the time must be HH:MM")?;
         let (h, m): (i8, i8) = (h.parse().ok().context("bad hour")?, m.parse().ok().context("bad minute")?);
         if !(0..24).contains(&h) || !(0..60).contains(&m) {
-            bail!("bad schedule `{text}`: the time must be 00:00 to 23:59");
+            bail!("the time must be 00:00 to 23:59");
         }
-        return Ok(Schedule::Daily(h, m));
+        times.push((h, m));
     }
-    bail!("bad schedule `{text}`: use `every <N>m|h|d` or `daily HH:MM`")
+    times.sort();
+    times.dedup();
+    Ok(times)
+}
+
+/// `mon,wed,fri`, `mon-fri` (a range may wrap: `fri-mon`), or a mix.
+fn parse_days(text: &str) -> Result<u8> {
+    let day = |name: &str| DAY_NAMES.iter().position(|d| name.eq_ignore_ascii_case(d)).with_context(|| format!("`{name}` is not a day: use mon, tue, wed, thu, fri, sat, sun"));
+    let mut days = 0u8;
+    for part in text.split(',') {
+        let part = part.trim();
+        let (from, to) = match part.split_once('-') {
+            Some((from, to)) => (day(from.trim())?, day(to.trim())?),
+            None => (day(part)?, day(part)?),
+        };
+        let mut d = from;
+        loop {
+            days |= 1 << d;
+            if d == to {
+                break;
+            }
+            d = (d + 1) % 7;
+        }
+    }
+    Ok(days)
+}
+
+fn on_day(days: u8, date: jiff::civil::Date) -> bool {
+    days & (1 << date.weekday().to_monday_zero_offset()) != 0
+}
+
+fn occurrence(date: jiff::civil::Date, (hour, minute): (i8, i8), tz: &jiff::tz::TimeZone) -> Option<jiff::Timestamp> {
+    date.at(hour, minute, 0, 0).to_zoned(tz.clone()).ok().map(|z| z.timestamp())
+}
+
+/// The most recent scheduled time at or before `now`.
+fn latest_at(days: u8, times: &[(i8, i8)], now: &jiff::Zoned) -> Option<jiff::Timestamp> {
+    let (today, tz) = (now.date(), now.time_zone());
+    (0..=7).find_map(|back| {
+        let date = today.checked_sub(jiff::Span::new().days(back)).ok()?;
+        if !on_day(days, date) {
+            return None;
+        }
+        times.iter().filter_map(|t| occurrence(date, *t, tz)).filter(|at| *at <= now.timestamp()).max()
+    })
+}
+
+/// The first scheduled time after `last`.
+fn next_after(days: u8, times: &[(i8, i8)], last: jiff::Timestamp, tz: &jiff::tz::TimeZone) -> Option<jiff::Timestamp> {
+    let start = last.to_zoned(tz.clone()).date();
+    (0..=8).find_map(|ahead| {
+        let date = start.checked_add(jiff::Span::new().days(ahead)).ok()?;
+        if !on_day(days, date) {
+            return None;
+        }
+        times.iter().filter_map(|t| occurrence(date, *t, tz)).filter(|at| *at > last).min()
+    })
 }
 
 /// Whether a routine is due, comparing with its stored last run. The time zone
 /// is read on each use, so `daily HH:MM` stays right across a daylight-saving
-/// change in a long-running ticker.
+/// change in a long-running ticker. A ticker that was down over a scheduled
+/// time runs it once when it is back.
 pub fn is_due(schedule: &Schedule, last_run: jiff::Timestamp, now: &jiff::Zoned) -> bool {
     match schedule {
         Schedule::Every(seconds) => now.timestamp().as_second() - last_run.as_second() >= *seconds,
-        Schedule::Daily(hour, minute) => {
-            let Ok(today) = now.with().hour(*hour).minute(*minute).second(0).subsec_nanosecond(0).build() else {
-                return false;
-            };
-            // The most recent occurrence of HH:MM at or before now.
-            let latest = if today.timestamp() <= now.timestamp() {
-                today
-            } else {
-                match today.yesterday() {
-                    Ok(yesterday) => yesterday,
-                    Err(_) => return false,
-                }
-            };
-            last_run < latest.timestamp()
-        }
+        Schedule::Daily(hour, minute) => latest_at(EVERY_DAY, &[(*hour, *minute)], now).is_some_and(|at| last_run < at),
+        Schedule::Weekly { days, times } => latest_at(*days, times, now).is_some_and(|at| last_run < at),
     }
 }
 
 /// When a routine is next due: the interval after its last run, or the first
-/// `HH:MM` after it. With no last run yet, the ticker's first look only
+/// scheduled time after it. With no last run yet, the ticker's first look only
 /// records one, so the next run is a schedule from now.
 pub fn next_run(schedule: &Schedule, last_run: Option<jiff::Timestamp>, now: &jiff::Zoned) -> Option<jiff::Timestamp> {
     let last = last_run.unwrap_or(now.timestamp());
     match schedule {
         Schedule::Every(seconds) => last.checked_add(jiff::SignedDuration::from_secs(*seconds)).ok(),
-        Schedule::Daily(hour, minute) => {
-            let at = last.to_zoned(now.time_zone().clone()).with().hour(*hour).minute(*minute).second(0).subsec_nanosecond(0).build().ok()?;
-            let at = if at.timestamp() > last { at } else { at.tomorrow().ok()? };
-            Some(at.timestamp())
-        }
+        Schedule::Daily(hour, minute) => next_after(EVERY_DAY, &[(*hour, *minute)], last, now.time_zone()),
+        Schedule::Weekly { days, times } => next_after(*days, times, last, now.time_zone()),
     }
 }
 
@@ -449,6 +516,65 @@ mod tests {
         let ran: jiff::Timestamp = "2026-10-24T05:30:05Z".parse().unwrap();
         assert!(!is_due(&schedule, ran, &zoned("2026-10-25T06:45:00+01:00[Europe/Stockholm]")));
         assert!(is_due(&schedule, ran, &zoned("2026-10-25T07:30:00+01:00[Europe/Stockholm]")));
+    }
+
+    #[test]
+    fn weekly_schedules_take_any_days_and_times() {
+        let weekly = |days: &[usize], times: &[(i8, i8)]| Schedule::Weekly { days: days.iter().map(|d| 1u8 << d).sum(), times: times.to_vec() };
+        assert_eq!(parse_schedule("weekly tue 09:00").unwrap(), weekly(&[1], &[(9, 0)]));
+        assert_eq!(parse_schedule("weekly mon,wed,fri 18:00").unwrap(), weekly(&[0, 2, 4], &[(18, 0)]));
+        assert_eq!(parse_schedule("weekly sun 07:00").unwrap(), weekly(&[6], &[(7, 0)]));
+        assert_eq!(parse_schedule("weekly Fri,sat,sun 02:30").unwrap(), weekly(&[4, 5, 6], &[(2, 30)]));
+        assert_eq!(parse_schedule("weekly mon-fri 17:00,08:30").unwrap(), weekly(&[0, 1, 2, 3, 4], &[(8, 30), (17, 0)]));
+        assert_eq!(parse_schedule("weekly fri-mon 10:00").unwrap(), weekly(&[4, 5, 6, 0], &[(10, 0)]), "a range may wrap");
+        assert_eq!(parse_schedule("weekly mon-sun 12:00").unwrap(), weekly(&[0, 1, 2, 3, 4, 5, 6], &[(12, 0)]));
+        assert_eq!(parse_schedule("daily 12:00,12:00").unwrap(), Schedule::Daily(12, 0), "a repeated time counts once");
+        assert_eq!(parse_schedule("daily 18:00,09:00").unwrap(), weekly(&[0, 1, 2, 3, 4, 5, 6], &[(9, 0), (18, 0)]));
+        for bad in ["weekly", "weekly mon", "weekly 09:00", "weekly funday 09:00", "weekly mon 25:00", "weekly mon,,tue 09:00", "weekly mon 9", "weekly mon 09:00,", "weekly mon- 09:00", "weekly mon, tue 09:00", "daily 09:00,"] {
+            assert!(parse_schedule(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn weekly_next_run_around_midnight() {
+        // 2026-10-22 is a Thursday; Paris is on summer time (+02:00).
+        let now = zoned("2026-10-20T12:00:00+02:00[Europe/Paris]");
+        let next = |schedule: &str, last: &str| next_run(&parse_schedule(schedule).unwrap(), Some(zoned(last).timestamp()), &now).map(|t| t.to_zoned(now.time_zone().clone()).to_string());
+        let paris = |text: &str| Some(format!("{text}+02:00[Europe/Paris]"));
+        // Just before midnight on Thursday: the Friday run the same night.
+        assert_eq!(next("weekly fri,sat,sun 02:30", "2026-10-22T23:59:59+02:00[Europe/Paris]"), paris("2026-10-23T02:30:00"));
+        assert_eq!(next("weekly fri,sat,sun 02:30", "2026-10-23T02:30:00+02:00[Europe/Paris]"), paris("2026-10-24T02:30:00"));
+        // A run at midnight: just before it, then just after it (next week).
+        assert_eq!(next("weekly tue 00:00", "2026-10-19T23:59:59+02:00[Europe/Paris]"), paris("2026-10-20T00:00:00"));
+        assert_eq!(next("weekly tue 00:00", "2026-10-20T00:00:01+02:00[Europe/Paris]"), paris("2026-10-27T00:00:00").map(|s| s.replace("+02:00", "+01:00")));
+        // A run just before midnight.
+        assert_eq!(next("weekly mon,wed,fri 23:59", "2026-10-19T23:58:00+02:00[Europe/Paris]"), paris("2026-10-19T23:59:00"));
+        assert_eq!(next("weekly mon,wed,fri 23:59", "2026-10-19T23:59:00+02:00[Europe/Paris]"), paris("2026-10-21T23:59:00"));
+        assert_eq!(next("weekly mon,wed,fri 23:59", "2026-10-21T23:59:30+02:00[Europe/Paris]"), paris("2026-10-23T23:59:00"));
+        // Several times a day, and over the weekend.
+        assert_eq!(next("weekly mon-fri 09:00,18:00", "2026-10-19T09:00:00+02:00[Europe/Paris]"), paris("2026-10-19T18:00:00"));
+        assert_eq!(next("weekly mon-fri 09:00,18:00", "2026-10-23T18:00:00+02:00[Europe/Paris]"), Some("2026-10-26T09:00:00+01:00[Europe/Paris]".into()));
+        assert_eq!(next("weekly sun 07:00", "2026-10-18T07:00:00+02:00[Europe/Paris]"), Some("2026-10-25T07:00:00+01:00[Europe/Paris]".into()));
+        assert_eq!(next("daily 09:00,18:00", "2026-10-19T18:00:00+02:00[Europe/Paris]"), paris("2026-10-20T09:00:00"));
+    }
+
+    #[test]
+    fn weekly_is_due_once_per_scheduled_time() {
+        let schedule = parse_schedule("weekly fri,sat,sun 02:30").unwrap();
+        let ran = zoned("2026-10-23T02:30:05+02:00[Europe/Paris]").timestamp();
+        assert!(!is_due(&schedule, ran, &zoned("2026-10-23T12:00:00+02:00[Europe/Paris]")));
+        assert!(!is_due(&schedule, ran, &zoned("2026-10-24T02:29:59+02:00[Europe/Paris]")));
+        assert!(is_due(&schedule, ran, &zoned("2026-10-24T02:30:00+02:00[Europe/Paris]")));
+        // Not on the days in between, and due again the next Friday.
+        let sunday = zoned("2026-10-25T02:30:05+01:00[Europe/Paris]").timestamp();
+        assert!(!is_due(&schedule, sunday, &zoned("2026-10-29T23:59:00+01:00[Europe/Paris]")));
+        assert!(is_due(&schedule, sunday, &zoned("2026-10-30T02:30:00+01:00[Europe/Paris]")));
+        // A ticker that was down over a run runs it once when it is back.
+        assert!(is_due(&schedule, ran, &zoned("2026-10-27T10:00:00+01:00[Europe/Paris]")));
+        let tuesday = parse_schedule("weekly tue 00:00").unwrap();
+        let ran = zoned("2026-10-13T00:00:02+02:00[Europe/Paris]").timestamp();
+        assert!(!is_due(&tuesday, ran, &zoned("2026-10-19T23:59:59+02:00[Europe/Paris]")));
+        assert!(is_due(&tuesday, ran, &zoned("2026-10-20T00:00:00+02:00[Europe/Paris]")));
     }
 
     #[test]

@@ -26,6 +26,9 @@ pub const PR_INTERVAL_SECS: i64 = 120;
 pub const MERGE_GRACE_SECS: i64 = 600;
 pub const DONE_RETENTION_DAYS: u64 = 30;
 const DEFAULT_OUTAGE_SECS: i64 = 600;
+/// A reported outage ends only after this long without a failure, so a machine
+/// that wakes briefly from sleep does not write "reachable again" each time.
+const DEFAULT_RECOVER_SECS: i64 = 900;
 
 /// `.state/ticker.json`: what the ticker compared against last time.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -63,10 +66,14 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
 }
 
 /// Continuous-failure tracking for `gh` or a machine: one item when it has
-/// failed for the threshold, one more when it recovers, nothing for blips.
+/// failed for the threshold, one more when it has worked again for the
+/// recovery delay, nothing for blips either way.
 #[derive(Debug, Clone, Default)]
 pub struct Outage {
     failing_since: Option<jiff::Timestamp>,
+    /// Since when it has worked without a failure, while a reported outage
+    /// waits for the recovery delay.
+    ok_since: Option<jiff::Timestamp>,
     reported: bool,
     pub last_error: String,
 }
@@ -78,13 +85,27 @@ pub enum OutageEvent {
 }
 
 impl Outage {
-    pub fn record(&mut self, ok: bool, error: &str, now: jiff::Timestamp, threshold_secs: i64) -> Option<OutageEvent> {
+    /// A reported outage that has not started to recover.
+    pub fn is_down(&self) -> bool {
+        self.reported && self.ok_since.is_none()
+    }
+
+    pub fn record(&mut self, ok: bool, error: &str, now: jiff::Timestamp, threshold_secs: i64, recover_secs: i64) -> Option<OutageEvent> {
         if ok {
-            let was_reported = self.reported;
+            if !self.reported {
+                *self = Outage::default();
+                return None;
+            }
+            let since = *self.ok_since.get_or_insert(now);
+            if now.as_second() - since.as_second() < recover_secs {
+                return None;
+            }
             *self = Outage::default();
-            return was_reported.then_some(OutageEvent::Recovered);
+            return Some(OutageEvent::Recovered);
         }
         self.last_error = error.to_string();
+        // A failure during the recovery delay is the same outage: no new item.
+        self.ok_since = None;
         let since = *self.failing_since.get_or_insert(now);
         if !self.reported && now.as_second() - since.as_second() >= threshold_secs {
             self.reported = true;
@@ -100,6 +121,9 @@ pub const SKIP_TICKS_AFTER_FAILURE: u64 = 8;
 #[derive(Debug, Clone, Default)]
 pub struct MachineMemory {
     pub outage: Outage,
+    /// An "unreachable" item was written for the current outage (none is
+    /// written while no thread works there, so no "reachable again" either).
+    pub announced: bool,
     /// Not polled again before this tick: one sleeping machine must not slow
     /// the other projects' ticks.
     pub skip_until_tick: u64,
@@ -113,6 +137,7 @@ pub struct Memory {
     /// The login `gh` acts as, asked once (`None` until known).
     pub gh_login: Option<String>,
     pub outage_secs: i64,
+    pub recover_secs: i64,
     pub tick: u64,
     pub machines: BTreeMap<String, MachineMemory>,
     /// The sidebar grouping tokens last sent.
@@ -127,6 +152,7 @@ impl Memory {
             gh_login: None,
             // Overridable so an outage can be exercised without waiting ten minutes.
             outage_secs: ctx.env.var("HERDR_PROJECTS_OUTAGE_SECS").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_OUTAGE_SECS),
+            recover_secs: ctx.env.var("HERDR_PROJECTS_RECOVER_SECS").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_RECOVER_SECS),
             tick: 0,
             machines: BTreeMap::new(),
             grouping: Default::default(),
@@ -148,21 +174,46 @@ impl Memory {
     }
 
     pub fn record_machine(&mut self, machine: &str, error: Option<&str>, now: jiff::Timestamp) -> Option<OutageEvent> {
-        let (tick, threshold) = (self.tick, self.outage_secs);
+        let (tick, threshold, recover) = (self.tick, self.outage_secs, self.recover_secs);
         let entry = self.machines.entry(machine.to_string()).or_default();
         if error.is_some() {
             entry.skip_until_tick = tick + SKIP_TICKS_AFTER_FAILURE + 1;
         }
-        entry.outage.record(error.is_none(), error.unwrap_or(""), now, threshold)
+        entry.outage.record(error.is_none(), error.unwrap_or(""), now, threshold, recover)
+    }
+}
+
+/// Whether a machine's outage concerns the coordinator: some open thread there
+/// still works (not finished and waiting for review, not idle).
+pub fn machine_needed(threads: &[Thread]) -> bool {
+    threads.iter().any(|t| t.last_group != Group::ReadyForReview.token() && t.last_group != Group::Idle.token())
+}
+
+/// The item to write for a machine, if any: "unreachable" once an outage is
+/// reported and some thread there works (also later, when one starts to work
+/// while it is still down), "reachable again" only after an "unreachable".
+fn machine_notice(event: Option<OutageEvent>, down: bool, announced: &mut bool, needed: bool) -> Option<OutageEvent> {
+    match event {
+        Some(OutageEvent::Recovered) => std::mem::take(announced).then_some(OutageEvent::Recovered),
+        _ if down && needed && !*announced => {
+            *announced = true;
+            Some(OutageEvent::Down)
+        }
+        _ => None,
     }
 }
 
 /// One `outage` item when a machine has been unreachable for the threshold,
-/// one more when it is back. Short outages write nothing.
-pub fn write_machine_outage(project: &Project, machine: &str, event: Option<OutageEvent>, memory: &Memory) -> Result<()> {
-    match event {
+/// one more when it is back. Short outages write nothing, and neither does an
+/// outage of a machine whose threads all wait for review or are idle (it is
+/// still polled, so their reports are still copied).
+pub fn write_machine_outage(project: &Project, machine: &str, event: Option<OutageEvent>, needed: bool, memory: &mut Memory) -> Result<()> {
+    let Some(entry) = memory.machines.get_mut(machine) else {
+        return Ok(());
+    };
+    match machine_notice(event, entry.outage.is_down(), &mut entry.announced, needed) {
         Some(OutageEvent::Down) => {
-            let error = memory.machines.get(machine).map(|m| pr::sanitize(&m.outage.last_error)).unwrap_or_default();
+            let error = pr::sanitize(&entry.outage.last_error);
             let summary = format!("machine `{machine}` has been unreachable for {} minutes; its threads keep their last known state. Last error: {error}", memory.outage_secs / 60);
             inbox::write(project, "outage", machine, "unreachable", &summary, "").map(|_| ())
         }
@@ -414,6 +465,12 @@ pub fn pr_routine_prompt(name: &str, body: &str, url: &str, events: &[&str], sum
     format!("[hp routine {name}] Your pull request {url} changed: {}.\n\n{}", facts.join("; "), body.trim())
 }
 
+/// Whether a pull request changed only by its head commit (a push): no event,
+/// so no item. Failing checks that went away are a change and keep their item.
+pub fn only_head_moved(old: &pr::Summary, new: &pr::Summary) -> bool {
+    old.head_oid != new.head_oid && *old == pr::Summary { head_oid: old.head_oid.clone(), ..new.clone() }
+}
+
 pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &mut Memory, now: jiff::Timestamp) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
     let notifier = crate::notify::Notifier::new(ctx, project);
@@ -488,6 +545,11 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
                 if old.as_ref() == Some(&summary) {
                     continue;
                 }
+                // The thread pushed and nothing else changed: remembered, no item.
+                if old.as_ref().is_some_and(|o| only_head_moved(o, &summary)) {
+                    state.prs.insert(t.id.clone(), summary);
+                    continue;
+                }
                 let (pr_state, pr_review) = (summary.state.clone(), summary.review_decision.clone());
                 errors.extend(thread::update(project, &t.id, |t| {
                     t.pr_state = pr_state;
@@ -517,14 +579,14 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
 }
 
 fn gh_worked(project: &Project, memory: &mut Memory, now: jiff::Timestamp, errors: &mut Vec<anyhow::Error>) {
-    if memory.gh.record(true, "", now, memory.outage_secs) == Some(OutageEvent::Recovered) {
+    if memory.gh.record(true, "", now, memory.outage_secs, memory.recover_secs) == Some(OutageEvent::Recovered) {
         errors.extend(inbox::write(project, "outage", "gh", "working again", "`gh` is working again; pull request follow-up has resumed", "").err());
     }
 }
 
 fn gh_failed(project: &Project, notifier: &crate::notify::Notifier, memory: &mut Memory, error: &anyhow::Error, now: jiff::Timestamp, errors: &mut Vec<anyhow::Error>) {
     let text = pr::sanitize(&format!("{error:#}"));
-    if memory.gh.record(false, &text, now, memory.outage_secs) == Some(OutageEvent::Down) {
+    if memory.gh.record(false, &text, now, memory.outage_secs, memory.recover_secs) == Some(OutageEvent::Down) {
         let summary = format!("`gh` has been failing for {} minutes; pull requests are not being followed. Last error: {text}", memory.outage_secs / 60);
         errors.extend(inbox::write(project, "outage", "gh", "failing", &summary, "").err());
         notifier.send("gh", "pull requests are not being followed: `gh` keeps failing", crate::notify::Sound::None, true);
@@ -755,7 +817,7 @@ mod tests {
     }
 
     fn memory() -> Memory {
-        Memory { started: jiff::Timestamp::now(), gh: Outage::default(), gh_login: None, outage_secs: DEFAULT_OUTAGE_SECS, tick: 0, machines: BTreeMap::new(), grouping: Default::default() }
+        Memory { started: jiff::Timestamp::now(), gh: Outage::default(), gh_login: None, outage_secs: DEFAULT_OUTAGE_SECS, recover_secs: DEFAULT_RECOVER_SECS, tick: 0, machines: BTreeMap::new(), grouping: Default::default() }
     }
 
     #[test]
@@ -827,17 +889,78 @@ mod tests {
     }
 
     #[test]
+    fn a_push_alone_changes_only_the_head_commit() {
+        let open = pr::Summary { state: "OPEN".into(), head_oid: "aaa".into(), ..pr::Summary::default() };
+        let pushed = pr::Summary { head_oid: "bbb".into(), ..open.clone() };
+        assert!(only_head_moved(&open, &pushed));
+        assert!(pr_events(Some(&open), &pushed, Some("me")).is_empty());
+        assert!(!only_head_moved(&open, &open), "no change at all is not a push");
+        let failing = pr::Summary { failing_checks: vec!["lint".into()], ..open.clone() };
+        let fixed = pr::Summary { head_oid: "bbb".into(), ..open.clone() };
+        assert!(!only_head_moved(&failing, &fixed), "failing checks that went away keep their item");
+        let commented = pr::Summary { head_oid: "bbb".into(), comment_count: 1, ..open.clone() };
+        assert!(!only_head_moved(&open, &commented));
+    }
+
+    #[test]
     fn short_outages_write_nothing_and_long_ones_write_one_item_each_way() {
         let mut outage = Outage::default();
-        assert_eq!(outage.record(false, "e", at("2026-09-17T10:00:00Z"), 600), None);
-        assert_eq!(outage.record(false, "e", at("2026-09-17T10:05:00Z"), 600), None);
+        assert_eq!(outage.record(false, "e", at("2026-09-17T10:00:00Z"), 600, 0), None);
+        assert_eq!(outage.record(false, "e", at("2026-09-17T10:05:00Z"), 600, 0), None);
         // A blip that ends before the threshold reports nothing at all.
-        assert_eq!(outage.record(true, "", at("2026-09-17T10:06:00Z"), 600), None);
+        assert_eq!(outage.record(true, "", at("2026-09-17T10:06:00Z"), 600, 0), None);
 
-        assert_eq!(outage.record(false, "e", at("2026-09-17T11:00:00Z"), 600), None);
-        assert_eq!(outage.record(false, "e", at("2026-09-17T11:10:00Z"), 600), Some(OutageEvent::Down));
-        assert_eq!(outage.record(false, "e", at("2026-09-17T11:30:00Z"), 600), None);
-        assert_eq!(outage.record(true, "", at("2026-09-17T11:31:00Z"), 600), Some(OutageEvent::Recovered));
-        assert_eq!(outage.record(true, "", at("2026-09-17T11:32:00Z"), 600), None);
+        assert_eq!(outage.record(false, "e", at("2026-09-17T11:00:00Z"), 600, 0), None);
+        assert_eq!(outage.record(false, "e", at("2026-09-17T11:10:00Z"), 600, 0), Some(OutageEvent::Down));
+        assert_eq!(outage.record(false, "e", at("2026-09-17T11:30:00Z"), 600, 0), None);
+        assert_eq!(outage.record(true, "", at("2026-09-17T11:31:00Z"), 600, 0), Some(OutageEvent::Recovered));
+        assert_eq!(outage.record(true, "", at("2026-09-17T11:32:00Z"), 600, 0), None);
+    }
+
+    #[test]
+    fn a_machine_whose_threads_all_wait_for_review_or_idle_writes_no_outage_items() {
+        let thread = |group: &str| Thread { last_group: group.into(), ..Thread::default() };
+        assert!(!machine_needed(&[thread("ready-for-review"), thread("idle")]));
+        assert!(machine_needed(&[thread("ready-for-review"), thread("working")]));
+        assert!(machine_needed(&[thread("waiting-on-you")]));
+
+        // Nobody works there: nothing either way.
+        let mut announced = false;
+        assert_eq!(machine_notice(Some(OutageEvent::Down), true, &mut announced, false), None);
+        assert_eq!(machine_notice(None, true, &mut announced, false), None);
+        assert_eq!(machine_notice(Some(OutageEvent::Recovered), false, &mut announced, false), None);
+        // A thread starts to work while the machine is still down: one item then.
+        assert_eq!(machine_notice(Some(OutageEvent::Down), true, &mut announced, false), None);
+        assert_eq!(machine_notice(None, true, &mut announced, true), Some(OutageEvent::Down));
+        assert_eq!(machine_notice(None, true, &mut announced, true), None);
+        // Back: "reachable again", even if its threads have finished since.
+        assert_eq!(machine_notice(Some(OutageEvent::Recovered), false, &mut announced, false), Some(OutageEvent::Recovered));
+        assert!(!announced);
+        // An ordinary outage of a busy machine.
+        assert_eq!(machine_notice(Some(OutageEvent::Down), true, &mut announced, true), Some(OutageEvent::Down));
+        assert_eq!(machine_notice(Some(OutageEvent::Recovered), false, &mut announced, true), Some(OutageEvent::Recovered));
+    }
+
+    #[test]
+    fn a_machine_that_wakes_briefly_stays_in_one_outage_until_it_has_worked_for_the_delay() {
+        let mut outage = Outage::default();
+        let record = |o: &mut Outage, ok: bool, t: &str| o.record(ok, if ok { "" } else { "e" }, at(t), 600, 900);
+        assert_eq!(record(&mut outage, false, "2026-09-17T10:00:00Z"), None);
+        assert_eq!(record(&mut outage, false, "2026-09-17T10:10:00Z"), Some(OutageEvent::Down));
+        // Short wakes between sleeps: no "reachable again", and no new "unreachable".
+        for minute in [30, 50] {
+            assert_eq!(record(&mut outage, true, &format!("2026-09-17T10:{minute}:00Z")), None);
+            assert_eq!(record(&mut outage, true, &format!("2026-09-17T10:{}:00Z", minute + 1)), None);
+            assert_eq!(record(&mut outage, false, &format!("2026-09-17T10:{}:00Z", minute + 2)), None);
+            assert_eq!(record(&mut outage, false, &format!("2026-09-17T10:{}:00Z", minute + 8)), None);
+        }
+        // Back for good: one item once it has worked for fifteen minutes.
+        assert_eq!(record(&mut outage, true, "2026-09-17T11:00:00Z"), None);
+        assert_eq!(record(&mut outage, true, "2026-09-17T11:14:59Z"), None);
+        assert_eq!(record(&mut outage, true, "2026-09-17T11:15:00Z"), Some(OutageEvent::Recovered));
+        assert_eq!(record(&mut outage, true, "2026-09-17T11:16:00Z"), None);
+        // The next outage starts from scratch.
+        assert_eq!(record(&mut outage, false, "2026-09-17T12:00:00Z"), None);
+        assert_eq!(record(&mut outage, false, "2026-09-17T12:10:00Z"), Some(OutageEvent::Down));
     }
 }
