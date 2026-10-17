@@ -992,7 +992,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
             Ok(found) => transitions.extend(found),
             Err(error) => errors.push(anyhow::anyhow!("{machine}: unreachable this tick: {error}")),
         }
-        errors.extend(steps::write_machine_outage(project, &machine, event, memory).err());
+        errors.extend(steps::write_machine_outage(project, &machine, event, steps::machine_needed(&threads), memory).err());
     }
 
     let notifier = crate::notify::Notifier::new(ctx, project);

@@ -85,6 +85,11 @@ pub enum OutageEvent {
 }
 
 impl Outage {
+    /// A reported outage that has not started to recover.
+    pub fn is_down(&self) -> bool {
+        self.reported && self.ok_since.is_none()
+    }
+
     pub fn record(&mut self, ok: bool, error: &str, now: jiff::Timestamp, threshold_secs: i64, recover_secs: i64) -> Option<OutageEvent> {
         if ok {
             if !self.reported {
@@ -116,6 +121,9 @@ pub const SKIP_TICKS_AFTER_FAILURE: u64 = 8;
 #[derive(Debug, Clone, Default)]
 pub struct MachineMemory {
     pub outage: Outage,
+    /// An "unreachable" item was written for the current outage (none is
+    /// written while no thread works there, so no "reachable again" either).
+    pub announced: bool,
     /// Not polled again before this tick: one sleeping machine must not slow
     /// the other projects' ticks.
     pub skip_until_tick: u64,
@@ -173,12 +181,37 @@ impl Memory {
     }
 }
 
-/// One `outage` item when a machine has been unreachable for the threshold,
-/// one more when it is back. Short outages write nothing.
-pub fn write_machine_outage(project: &Project, machine: &str, event: Option<OutageEvent>, memory: &Memory) -> Result<()> {
+/// Whether a machine's outage concerns the coordinator: some open thread there
+/// still works (not finished and waiting for review, not idle).
+pub fn machine_needed(threads: &[Thread]) -> bool {
+    threads.iter().any(|t| t.last_group != Group::ReadyForReview.token() && t.last_group != Group::Idle.token())
+}
+
+/// The item to write for a machine, if any: "unreachable" once an outage is
+/// reported and some thread there works (also later, when one starts to work
+/// while it is still down), "reachable again" only after an "unreachable".
+fn machine_notice(event: Option<OutageEvent>, down: bool, announced: &mut bool, needed: bool) -> Option<OutageEvent> {
     match event {
+        Some(OutageEvent::Recovered) => std::mem::take(announced).then_some(OutageEvent::Recovered),
+        _ if down && needed && !*announced => {
+            *announced = true;
+            Some(OutageEvent::Down)
+        }
+        _ => None,
+    }
+}
+
+/// One `outage` item when a machine has been unreachable for the threshold,
+/// one more when it is back. Short outages write nothing, and neither does an
+/// outage of a machine whose threads all wait for review or are idle (it is
+/// still polled, so their reports are still copied).
+pub fn write_machine_outage(project: &Project, machine: &str, event: Option<OutageEvent>, needed: bool, memory: &mut Memory) -> Result<()> {
+    let Some(entry) = memory.machines.get_mut(machine) else {
+        return Ok(());
+    };
+    match machine_notice(event, entry.outage.is_down(), &mut entry.announced, needed) {
         Some(OutageEvent::Down) => {
-            let error = memory.machines.get(machine).map(|m| pr::sanitize(&m.outage.last_error)).unwrap_or_default();
+            let error = pr::sanitize(&entry.outage.last_error);
             let summary = format!("machine `{machine}` has been unreachable for {} minutes; its threads keep their last known state. Last error: {error}", memory.outage_secs / 60);
             inbox::write(project, "outage", machine, "unreachable", &summary, "").map(|_| ())
         }
@@ -829,6 +862,30 @@ mod tests {
         assert_eq!(outage.record(false, "e", at("2026-09-17T11:30:00Z"), 600, 0), None);
         assert_eq!(outage.record(true, "", at("2026-09-17T11:31:00Z"), 600, 0), Some(OutageEvent::Recovered));
         assert_eq!(outage.record(true, "", at("2026-09-17T11:32:00Z"), 600, 0), None);
+    }
+
+    #[test]
+    fn a_machine_whose_threads_all_wait_for_review_or_idle_writes_no_outage_items() {
+        let thread = |group: &str| Thread { last_group: group.into(), ..Thread::default() };
+        assert!(!machine_needed(&[thread("ready-for-review"), thread("idle")]));
+        assert!(machine_needed(&[thread("ready-for-review"), thread("working")]));
+        assert!(machine_needed(&[thread("waiting-on-you")]));
+
+        // Nobody works there: nothing either way.
+        let mut announced = false;
+        assert_eq!(machine_notice(Some(OutageEvent::Down), true, &mut announced, false), None);
+        assert_eq!(machine_notice(None, true, &mut announced, false), None);
+        assert_eq!(machine_notice(Some(OutageEvent::Recovered), false, &mut announced, false), None);
+        // A thread starts to work while the machine is still down: one item then.
+        assert_eq!(machine_notice(Some(OutageEvent::Down), true, &mut announced, false), None);
+        assert_eq!(machine_notice(None, true, &mut announced, true), Some(OutageEvent::Down));
+        assert_eq!(machine_notice(None, true, &mut announced, true), None);
+        // Back: "reachable again", even if its threads have finished since.
+        assert_eq!(machine_notice(Some(OutageEvent::Recovered), false, &mut announced, false), Some(OutageEvent::Recovered));
+        assert!(!announced);
+        // An ordinary outage of a busy machine.
+        assert_eq!(machine_notice(Some(OutageEvent::Down), true, &mut announced, true), Some(OutageEvent::Down));
+        assert_eq!(machine_notice(Some(OutageEvent::Recovered), false, &mut announced, true), Some(OutageEvent::Recovered));
     }
 
     #[test]
