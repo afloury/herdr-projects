@@ -26,6 +26,9 @@ pub const PR_INTERVAL_SECS: i64 = 120;
 pub const MERGE_GRACE_SECS: i64 = 600;
 pub const DONE_RETENTION_DAYS: u64 = 30;
 const DEFAULT_OUTAGE_SECS: i64 = 600;
+/// A reported outage ends only after this long without a failure, so a machine
+/// that wakes briefly from sleep does not write "reachable again" each time.
+const DEFAULT_RECOVER_SECS: i64 = 900;
 
 /// `.state/ticker.json`: what the ticker compared against last time.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -63,10 +66,14 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
 }
 
 /// Continuous-failure tracking for `gh` or a machine: one item when it has
-/// failed for the threshold, one more when it recovers, nothing for blips.
+/// failed for the threshold, one more when it has worked again for the
+/// recovery delay, nothing for blips either way.
 #[derive(Debug, Clone, Default)]
 pub struct Outage {
     failing_since: Option<jiff::Timestamp>,
+    /// Since when it has worked without a failure, while a reported outage
+    /// waits for the recovery delay.
+    ok_since: Option<jiff::Timestamp>,
     reported: bool,
     pub last_error: String,
 }
@@ -78,13 +85,22 @@ pub enum OutageEvent {
 }
 
 impl Outage {
-    pub fn record(&mut self, ok: bool, error: &str, now: jiff::Timestamp, threshold_secs: i64) -> Option<OutageEvent> {
+    pub fn record(&mut self, ok: bool, error: &str, now: jiff::Timestamp, threshold_secs: i64, recover_secs: i64) -> Option<OutageEvent> {
         if ok {
-            let was_reported = self.reported;
+            if !self.reported {
+                *self = Outage::default();
+                return None;
+            }
+            let since = *self.ok_since.get_or_insert(now);
+            if now.as_second() - since.as_second() < recover_secs {
+                return None;
+            }
             *self = Outage::default();
-            return was_reported.then_some(OutageEvent::Recovered);
+            return Some(OutageEvent::Recovered);
         }
         self.last_error = error.to_string();
+        // A failure during the recovery delay is the same outage: no new item.
+        self.ok_since = None;
         let since = *self.failing_since.get_or_insert(now);
         if !self.reported && now.as_second() - since.as_second() >= threshold_secs {
             self.reported = true;
@@ -113,6 +129,7 @@ pub struct Memory {
     /// The login `gh` acts as, asked once (`None` until known).
     pub gh_login: Option<String>,
     pub outage_secs: i64,
+    pub recover_secs: i64,
     pub tick: u64,
     pub machines: BTreeMap<String, MachineMemory>,
     /// The sidebar grouping tokens last sent.
@@ -127,6 +144,7 @@ impl Memory {
             gh_login: None,
             // Overridable so an outage can be exercised without waiting ten minutes.
             outage_secs: ctx.env.var("HERDR_PROJECTS_OUTAGE_SECS").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_OUTAGE_SECS),
+            recover_secs: ctx.env.var("HERDR_PROJECTS_RECOVER_SECS").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_RECOVER_SECS),
             tick: 0,
             machines: BTreeMap::new(),
             grouping: Default::default(),
@@ -146,12 +164,12 @@ impl Memory {
     }
 
     pub fn record_machine(&mut self, machine: &str, error: Option<&str>, now: jiff::Timestamp) -> Option<OutageEvent> {
-        let (tick, threshold) = (self.tick, self.outage_secs);
+        let (tick, threshold, recover) = (self.tick, self.outage_secs, self.recover_secs);
         let entry = self.machines.entry(machine.to_string()).or_default();
         if error.is_some() {
             entry.skip_until_tick = tick + SKIP_TICKS_AFTER_FAILURE + 1;
         }
-        entry.outage.record(error.is_none(), error.unwrap_or(""), now, threshold)
+        entry.outage.record(error.is_none(), error.unwrap_or(""), now, threshold, recover)
     }
 }
 
@@ -515,14 +533,14 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
 }
 
 fn gh_worked(project: &Project, memory: &mut Memory, now: jiff::Timestamp, errors: &mut Vec<anyhow::Error>) {
-    if memory.gh.record(true, "", now, memory.outage_secs) == Some(OutageEvent::Recovered) {
+    if memory.gh.record(true, "", now, memory.outage_secs, memory.recover_secs) == Some(OutageEvent::Recovered) {
         errors.extend(inbox::write(project, "outage", "gh", "working again", "`gh` is working again; pull request follow-up has resumed", "").err());
     }
 }
 
 fn gh_failed(project: &Project, notifier: &crate::notify::Notifier, memory: &mut Memory, error: &anyhow::Error, now: jiff::Timestamp, errors: &mut Vec<anyhow::Error>) {
     let text = pr::sanitize(&format!("{error:#}"));
-    if memory.gh.record(false, &text, now, memory.outage_secs) == Some(OutageEvent::Down) {
+    if memory.gh.record(false, &text, now, memory.outage_secs, memory.recover_secs) == Some(OutageEvent::Down) {
         let summary = format!("`gh` has been failing for {} minutes; pull requests are not being followed. Last error: {text}", memory.outage_secs / 60);
         errors.extend(inbox::write(project, "outage", "gh", "failing", &summary, "").err());
         notifier.send("gh", "pull requests are not being followed: `gh` keeps failing", crate::notify::Sound::None, true);
@@ -801,15 +819,38 @@ mod tests {
     #[test]
     fn short_outages_write_nothing_and_long_ones_write_one_item_each_way() {
         let mut outage = Outage::default();
-        assert_eq!(outage.record(false, "e", at("2026-09-17T10:00:00Z"), 600), None);
-        assert_eq!(outage.record(false, "e", at("2026-09-17T10:05:00Z"), 600), None);
+        assert_eq!(outage.record(false, "e", at("2026-09-17T10:00:00Z"), 600, 0), None);
+        assert_eq!(outage.record(false, "e", at("2026-09-17T10:05:00Z"), 600, 0), None);
         // A blip that ends before the threshold reports nothing at all.
-        assert_eq!(outage.record(true, "", at("2026-09-17T10:06:00Z"), 600), None);
+        assert_eq!(outage.record(true, "", at("2026-09-17T10:06:00Z"), 600, 0), None);
 
-        assert_eq!(outage.record(false, "e", at("2026-09-17T11:00:00Z"), 600), None);
-        assert_eq!(outage.record(false, "e", at("2026-09-17T11:10:00Z"), 600), Some(OutageEvent::Down));
-        assert_eq!(outage.record(false, "e", at("2026-09-17T11:30:00Z"), 600), None);
-        assert_eq!(outage.record(true, "", at("2026-09-17T11:31:00Z"), 600), Some(OutageEvent::Recovered));
-        assert_eq!(outage.record(true, "", at("2026-09-17T11:32:00Z"), 600), None);
+        assert_eq!(outage.record(false, "e", at("2026-09-17T11:00:00Z"), 600, 0), None);
+        assert_eq!(outage.record(false, "e", at("2026-09-17T11:10:00Z"), 600, 0), Some(OutageEvent::Down));
+        assert_eq!(outage.record(false, "e", at("2026-09-17T11:30:00Z"), 600, 0), None);
+        assert_eq!(outage.record(true, "", at("2026-09-17T11:31:00Z"), 600, 0), Some(OutageEvent::Recovered));
+        assert_eq!(outage.record(true, "", at("2026-09-17T11:32:00Z"), 600, 0), None);
+    }
+
+    #[test]
+    fn a_machine_that_wakes_briefly_stays_in_one_outage_until_it_has_worked_for_the_delay() {
+        let mut outage = Outage::default();
+        let record = |o: &mut Outage, ok: bool, t: &str| o.record(ok, if ok { "" } else { "e" }, at(t), 600, 900);
+        assert_eq!(record(&mut outage, false, "2026-09-17T10:00:00Z"), None);
+        assert_eq!(record(&mut outage, false, "2026-09-17T10:10:00Z"), Some(OutageEvent::Down));
+        // Short wakes between sleeps: no "reachable again", and no new "unreachable".
+        for minute in [30, 50] {
+            assert_eq!(record(&mut outage, true, &format!("2026-09-17T10:{minute}:00Z")), None);
+            assert_eq!(record(&mut outage, true, &format!("2026-09-17T10:{}:00Z", minute + 1)), None);
+            assert_eq!(record(&mut outage, false, &format!("2026-09-17T10:{}:00Z", minute + 2)), None);
+            assert_eq!(record(&mut outage, false, &format!("2026-09-17T10:{}:00Z", minute + 8)), None);
+        }
+        // Back for good: one item once it has worked for fifteen minutes.
+        assert_eq!(record(&mut outage, true, "2026-09-17T11:00:00Z"), None);
+        assert_eq!(record(&mut outage, true, "2026-09-17T11:14:59Z"), None);
+        assert_eq!(record(&mut outage, true, "2026-09-17T11:15:00Z"), Some(OutageEvent::Recovered));
+        assert_eq!(record(&mut outage, true, "2026-09-17T11:16:00Z"), None);
+        // The next outage starts from scratch.
+        assert_eq!(record(&mut outage, false, "2026-09-17T12:00:00Z"), None);
+        assert_eq!(record(&mut outage, false, "2026-09-17T12:10:00Z"), Some(OutageEvent::Down));
     }
 }

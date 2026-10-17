@@ -1355,6 +1355,7 @@ fn a_long_gh_outage_gives_one_item_and_one_recovery_item() {
     let ctx = world.ctx();
     let mut memory = Memory::new(&ctx);
     memory.outage_secs = 0;
+    memory.recover_secs = 0;
     let mut state = crate::steps::State::default();
     let now = jiff::Timestamp::now();
     for _ in 0..3 {
@@ -1695,6 +1696,7 @@ fn a_long_machine_outage_gives_one_item_and_one_recovery_item() {
     let ctx = scripted.ctx();
     let mut memory = Memory::new(&ctx);
     memory.outage_secs = 0;
+    memory.recover_secs = 0;
 
     for tick in [1, 10, 19] {
         memory.tick = tick;
