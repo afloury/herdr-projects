@@ -1,4 +1,4 @@
-> **This is a fork.** [afloury/herdr-projects](https://github.com/afloury/herdr-projects) is maintained from [eliasstravik/herdr-projects](https://github.com/eliasstravik/herdr-projects) (MIT, the original copyright and license kept in [LICENSE](LICENSE)) while upstream is paused. It adds fixes not yet merged upstream (omp input box, dim text in `thread read`, coordinator rules). Update it with `sh scripts/update-fork.sh`, not `herdr-projects update`, which installs upstream releases; see [Updating this fork](#updating-this-fork).
+> **This is a fork.** [afloury/herdr-projects](https://github.com/afloury/herdr-projects) is maintained from [eliasstravik/herdr-projects](https://github.com/eliasstravik/herdr-projects) (MIT, the original copyright and license kept in [LICENSE](LICENSE)) Upstream ended the Rust version at 0.2.35 (its `legacy` branch) and moved to a rewrite; this fork carries the Rust version on from 0.2.36. It adds fixes upstream does not have (omp input box, dim text in `thread read`, coordinator rules, quieter coordinator wakes, weekly routine schedules); see [CHANGELOG.md](CHANGELOG.md). Update it with `sh scripts/update-fork.sh`, not `herdr-projects update`, which installs upstream releases; see [Updating this fork](#updating-this-fork).
 
 <p align="center"><img src="https://img.shields.io/badge/Herdr%20Projects-Projects%20for%20Herdr-2ea44f?style=flat-square&labelColor=24292f" alt="Herdr Projects | Projects for Herdr" /></p>
 
@@ -105,11 +105,11 @@ sh scripts/update-fork.sh
 
 It fetches the fork's `main`, checks it out detached, builds it with `cargo build --release` (in the `rust:1-alpine` Docker image when Cargo is not installed; `LOCK=/path/to/lock` runs the build under `flock`), stops the ticker with the old binary, swaps `target/release/herdr-projects`, runs `doctor --fix` and starts the ticker again. The folder must have no uncommitted changes.
 
-To bring in upstream changes, in a checkout of the fork:
+To bring in upstream changes to the Rust version (its `legacy` branch; upstream `main` is the rewrite and must not be merged), in a checkout of the fork:
 
 ```bash
 git remote add upstream https://github.com/eliasstravik/herdr-projects.git   # once
-git fetch upstream && git checkout main && git merge upstream/main
+git fetch upstream legacy && git checkout main && git merge upstream/legacy
 cargo test --locked && git push fork main
 ```
 
