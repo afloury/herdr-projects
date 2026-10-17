@@ -122,6 +122,8 @@ pub struct Current {
     pub pane_id: String,
     pub terminal_id: String,
     pub agent: String,
+    /// The whole `pane current` reply: workspace, tab and both directories.
+    pub pane: crate::herdr::Pane,
 }
 
 pub fn current(env: &Env, runner: &dyn Runner) -> Option<Current> {
@@ -137,13 +139,94 @@ pub fn current_within(env: &Env, runner: &dyn Runner, timeout: std::time::Durati
     let socket = env.var("HERDR_SOCKET_PATH")?.to_string();
     let herdr = Herdr::new(env.herdr_bin(), &socket, runner);
     let result = herdr.call(&["pane", "current", "--current"], timeout).ok()?;
-    let pane = &result["pane"];
-    let pane_id = pane["pane_id"].as_str()?.to_string();
+    let reply = &result["pane"];
+    let pane_id = reply["pane_id"].as_str()?.to_string();
+    let pane = crate::herdr::Pane {
+        pane_id: pane_id.clone(),
+        tab_id: reply["tab_id"].as_str().unwrap_or("").to_string(),
+        workspace_id: reply["workspace_id"].as_str().unwrap_or("").to_string(),
+        cwd: reply["cwd"].as_str().unwrap_or("").to_string(),
+        foreground_cwd: reply["foreground_cwd"].as_str().unwrap_or("").to_string(),
+        terminal_id: reply["terminal_id"].as_str().unwrap_or("").to_string(),
+        focused: false,
+    };
     Some(Current {
         socket,
         pane_id,
-        terminal_id: pane["terminal_id"].as_str().unwrap_or("").to_string(),
-        agent: pane["agent"].as_str().unwrap_or("").to_string(),
+        terminal_id: pane.terminal_id.clone(),
+        agent: reply["agent"].as_str().unwrap_or("").to_string(),
+        pane,
+    })
+}
+
+/// True when the calling pane is one of a project's coordinators or an open
+/// local thread on the same server: the only panes the hooks speak in.
+///
+/// Every tool call in every pane on the machine runs the hook, so files are
+/// read first and Herdr is asked only when the pane could be a project's (its
+/// directory is a project home, or an open thread records its pane id). Fails
+/// closed: when Herdr cannot list the agents, the hook stays silent.
+fn managed(ctx: &Ctx, current: &Current) -> bool {
+    use crate::{coordinator, project, thread};
+    let pane = &current.pane;
+    // Ids are only unique within one server: a project whose coordinator was
+    // recorded on another socket cannot own this pane. A project never
+    // opened (no record) may still be coordinated by an agent started by hand.
+    let projects: Vec<_> = project::list_slugs(&ctx.root)
+        .iter()
+        .filter_map(|slug| project::Project::load(&ctx.root, slug).ok())
+        .map(|project| {
+            let record = project.coordinator();
+            (project, record)
+        })
+        .filter(|(_, record)| record.as_ref().is_none_or(|r| r.socket == current.socket))
+        .collect();
+    let in_home = |project: &project::Project| {
+        let home = project.canonical_dir().to_string_lossy().into_owned();
+        crate::herdr::own_dir(&pane.cwd, &pane.foreground_cwd) == home
+    };
+    // A thread record carries no socket of its own: only the project's
+    // coordinator record ties its pane ids to this server.
+    let threads = |project: &project::Project, record: &Option<project::Coordinator>| -> Vec<thread::Thread> {
+        if record.is_none() {
+            return Vec::new();
+        }
+        thread::list(project).into_iter().filter(|t| !t.is_remote() && t.status != thread::Status::Resolved && thread::pane_matches(t, pane)).collect()
+    };
+    let candidates: Vec<_> = projects.iter().filter(|(project, record)| in_home(project) || !threads(project, record).is_empty()).collect();
+    if candidates.is_empty() {
+        return false;
+    }
+    if candidates.iter().any(|(_, record)| record.as_ref().is_some_and(|r| coordinator::pane_matches(r, pane))) {
+        return true;
+    }
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &current.socket, ctx.runner);
+    let Some(agents) = herdr
+        .call(&["agent", "list"], std::time::Duration::from_secs(2))
+        .ok()
+        .and_then(|reply| serde_json::from_value::<Vec<crate::herdr::Agent>>(reply["agents"].clone()).ok())
+    else {
+        return false;
+    };
+    let mut agents: Vec<_> = agents.into_iter().filter(|a| a.pane_id == pane.pane_id && a.workspace_id == pane.workspace_id && a.tab_id == pane.tab_id && a.terminal_id == pane.terminal_id).collect();
+    if agents.is_empty() && current.agent.is_empty() {
+        // At SessionStart Herdr may not have detected the agent yet; the hook
+        // itself shows one is starting here, so stand in the pane for it.
+        agents.push(crate::herdr::Agent {
+            pane_id: pane.pane_id.clone(),
+            workspace_id: pane.workspace_id.clone(),
+            tab_id: pane.tab_id.clone(),
+            cwd: pane.cwd.clone(),
+            foreground_cwd: pane.foreground_cwd.clone(),
+            terminal_id: pane.terminal_id.clone(),
+            ..Default::default()
+        });
+    }
+    candidates.iter().any(|(project, record)| {
+        // A coordinator `open --new` or the user started that the ticker has
+        // not recorded yet: the ticker's own discovery rule.
+        coordinator::found(project, &current.socket, "", &agents).is_some_and(|r| coordinator::pane_matches(&r, pane))
+            || threads(project, record).iter().any(|t| agents.iter().any(|a| thread::agent_matches(t, a)))
     })
 }
 
@@ -298,8 +381,9 @@ pub fn output(harness: &crate::setup::Harness, native: &str, text: &str) -> serd
 }
 
 /// `hook --agent <harness>`, the entry point the harness hooks run. Silent
-/// (exit 0, no output) outside a Herdr pane, so the same hooks may sit in the
-/// user's settings for every session on the machine.
+/// (exit 0, no output, no record) outside a project's coordinator and local
+/// thread panes, so the same hooks may sit in the user's settings for every
+/// session on the machine.
 pub fn hook(ctx: &Ctx, agent: &str) -> Result<()> {
     if ctx.env.var("HERDR_ENV") != Some("1") || ctx.env.var("HERDR_PANE_ID").is_none() {
         return Ok(());
@@ -338,6 +422,9 @@ pub fn hook(ctx: &Ctx, agent: &str) -> Result<()> {
     };
     if !pane.agent.is_empty() && pane.agent != agent {
         return Ok(()); // another harness's hook fired in a pane that is not its own
+    }
+    if !managed(ctx, &pane) {
+        return Ok(());
     }
     let mut record = load(&ctx.root, &pane.socket, &pane.pane_id).unwrap_or_default();
     if kind != "SessionStart" && foreign_session(&record, &event) {
@@ -386,6 +473,25 @@ pub fn prune(root: &Path, socket: &str, live_pane_ids: &[String]) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_open_thread_speaks_before_herdr_detects_its_agent() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let home = tempfile::tempdir().unwrap();
+        let project = crate::project::create(home.path(), "demo", "", vec![]).unwrap();
+        project.update_coordinator(|c| c.socket = "/managed.sock".into()).unwrap();
+        let thread = crate::thread::Thread { id: "t-0001".into(), pane_id: "w1:p1".into(), cwd: "/worktree".into(), ..Default::default() };
+        crate::project::write_atomic(&crate::thread::record_path(&project, &thread.id), toml::to_string(&thread).unwrap().as_bytes()).unwrap();
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        let env = Env::for_test(home.path(), &[]);
+        let ctx = Ctx { env: &env, root: home.path().into(), config_dir: home.path().join("config"), runner: &runner, detached_ticker: false };
+        let pane = crate::herdr::Pane { pane_id: "w1:p1".into(), tab_id: "w1:t1".into(), workspace_id: "w1".into(), cwd: "/worktree".into(), terminal_id: "term-1".into(), ..Default::default() };
+        let current = |socket: &str| Current { socket: socket.into(), pane_id: "w1:p1".into(), terminal_id: "term-1".into(), agent: String::new(), pane: pane.clone() };
+        assert!(managed(&ctx, &current("/managed.sock")));
+        // The same pane id on another server is not the thread's.
+        assert!(!managed(&ctx, &current("/other.sock")));
+    }
 
     #[test]
     fn activity_is_cleaned_and_capped_at_forty_columns() {

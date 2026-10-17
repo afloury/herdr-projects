@@ -97,13 +97,15 @@ pub fn deliver(project: &Project, herdr: &Herdr, record: &Thread, agent: &Agent,
 
 fn step(project: &Project, herdr: &Herdr, t: &mut Thread, agent: &Agent, sender: Sender, now: jiff::Timestamp) -> Result<Outcome> {
     let state = agent.agent_status.as_str();
-    if matches!(state, "blocked" | "unknown" | "") {
+    if matches!(state, "blocked" | "") {
         t.brief_seen.clear();
         return Ok(Outcome::Waiting(format!("the agent is {}", if state.is_empty() { "not detected" } else { state })));
     }
-    let ready = agent.ready();
-    // Nothing typed yet and not ready: nothing to look at.
-    if t.brief_attempts == 0 && !ready {
+    let kind = if agent.agent.is_empty() { t.agent.as_str() } else { agent.agent.as_str() };
+    let ready = agent.ready_for_brief(kind);
+    // `unknown` without an open composer, or nothing typed yet and not
+    // ready: nothing to look at.
+    if (state == "unknown" || t.brief_attempts == 0) && !ready {
         t.brief_seen.clear();
         return Ok(Outcome::Waiting(format!("the agent is {state}")));
     }
@@ -111,7 +113,6 @@ fn step(project: &Project, herdr: &Herdr, t: &mut Thread, agent: &Agent, sender:
         Ok(screen) => screen,
         Err(error) => return Ok(Outcome::Waiting(format!("its screen could not be read: {error}"))),
     };
-    let kind = if agent.agent.is_empty() { t.agent.as_str() } else { agent.agent.as_str() };
     if let Some(phrase) = crate::trust_screen::detect(kind, &screen) {
         t.brief_seen.clear();
         return Ok(Outcome::TrustScreen(phrase));
@@ -262,6 +263,19 @@ mod tests {
     fn set_state(world: &World, state: &str) {
         let cwd = world.home.path().to_string_lossy().into_owned();
         *world.agents.borrow_mut() = format!("[{}]", agent_json("w2", "w2:t1", "w2:p1", &cwd, "hp-demo-t-0001", state));
+    }
+
+    /// Like `world`, for a thread of `kind` (Codex's real empty box on
+    /// screen) whose agent Herdr reports as `state`, with `interactive_ready`.
+    fn composer_world(kind: &str, state: &str, interactive_ready: bool) -> (World, Project, Rc<RefCell<std::result::Result<String, String>>>) {
+        let (world, project, reply) = world(state);
+        thread::update(&project, "t-0001", |t| t.agent = kind.into()).unwrap();
+        let cwd = world.home.path().to_string_lossy().into_owned();
+        let agent = agent_json("w2", "w2:t1", "w2:p1", &cwd, "hp-demo-t-0001", state).replace(r#""agent":"claude""#, &format!(r#""agent":"{kind}""#));
+        let agent = format!("{},\"interactive_ready\":{interactive_ready}}}", agent.strip_suffix('}').unwrap());
+        *world.agents.borrow_mut() = format!("[{agent}]");
+        *world.screen.borrow_mut() = std::fs::read_to_string(format!("{}/tests/fixtures/prompt_box/codex-empty.ansi", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        (world, project, reply)
     }
 
     fn line() -> String {
@@ -493,5 +507,90 @@ mod tests {
         *reply.borrow_mut() = Err(r#"{"error":{"code":"agent_blocked","message":"blocked"}}"#.into());
         assert!(crate::threads::prompt(&ctx, "demo", "t-0001", "Second.").is_err());
         assert!(!std::fs::read_to_string(thread::task_path(&project, "t-0001")).unwrap().contains("Second."));
+    }
+
+    // Codex can sit at an empty composer with `agent_status: "unknown"` and
+    // `interactive_ready: true` (Herdr 0.9.3, Codex 0.162.1): #121.
+
+    #[test]
+    fn a_codex_thread_at_unknown_with_an_open_composer_gets_its_brief_once() {
+        let (world, project, _) = composer_world("codex", "unknown", true);
+        let ctx = world.ctx();
+        // Seen once, then typed only after it stayed the same.
+        assert!(pass(&ctx));
+        assert_eq!(prompts(&world), 0);
+        settled(&project);
+        assert!(!pass(&ctx));
+        assert_eq!(prompts(&world), 1);
+        let t = record(&project);
+        assert!(!t.prompt_pending && t.brief_claimed.is_empty());
+        crate::ticker::tick_project(&ctx, &project).unwrap();
+        assert_eq!(prompts(&world), 1);
+    }
+
+    #[test]
+    fn a_codex_thread_at_unknown_without_an_open_composer_still_waits() {
+        let (world, project, _) = composer_world("codex", "unknown", false);
+        let ctx = world.ctx();
+        for _ in 0..3 {
+            settled(&project);
+            assert!(pass(&ctx));
+        }
+        assert_eq!(prompts(&world), 0);
+        assert!(record(&project).prompt_pending);
+    }
+
+    #[test]
+    fn an_unreadable_box_at_unknown_with_an_open_composer_still_waits() {
+        // Its box could not be checked for being empty, so `unknown` is not enough.
+        let (world, project, _) = composer_world("copilot", "unknown", true);
+        let ctx = world.ctx();
+        for _ in 0..3 {
+            settled(&project);
+            assert!(pass(&ctx));
+        }
+        assert_eq!(prompts(&world), 0);
+        assert!(record(&project).prompt_pending);
+        assert!(crate::threads::brief(&ctx, "demo", "t-0001").unwrap_err().to_string().contains("not ready for its brief"));
+        assert_eq!(prompts(&world), 0);
+    }
+
+    #[test]
+    fn a_blocked_codex_thread_gets_nothing_even_with_an_open_composer() {
+        let (world, project, _) = composer_world("codex", "blocked", true);
+        let ctx = world.ctx();
+        for _ in 0..3 {
+            settled(&project);
+            assert!(pass(&ctx));
+        }
+        assert_eq!(prompts(&world), 0);
+        assert!(record(&project).prompt_pending);
+    }
+
+    #[test]
+    fn thread_brief_sends_a_codex_thread_at_unknown_its_brief_once() {
+        let (world, project, _) = composer_world("codex", "unknown", true);
+        let ctx = world.ctx();
+        crate::threads::brief(&ctx, "demo", "t-0001").unwrap();
+        assert_eq!(prompts(&world), 1);
+        assert!(!record(&project).prompt_pending);
+        crate::threads::brief(&ctx, "demo", "t-0001").unwrap();
+        assert_eq!(prompts(&world), 1);
+    }
+
+    #[test]
+    fn a_codex_trust_screen_at_unknown_with_an_open_composer_is_never_typed_into() {
+        let (world, project, _) = composer_world("codex", "unknown", true);
+        *world.screen.borrow_mut() = "  Do you trust the contents of this directory?\n\u{1b}[1m\u{203a}\u{1b}[0m 1. Yes, continue\n  2. No, quit\n".into();
+        let ctx = world.ctx();
+        for _ in 0..3 {
+            settled(&project);
+            assert!(pass(&ctx));
+        }
+        assert_eq!(prompts(&world), 0);
+        assert!(record(&project).prompt_pending);
+        let err = crate::threads::brief(&ctx, "demo", "t-0001").unwrap_err();
+        assert!(err.to_string().contains("Do you trust the contents of this directory?"), "{err}");
+        assert_eq!(prompts(&world), 0);
     }
 }
