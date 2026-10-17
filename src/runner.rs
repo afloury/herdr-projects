@@ -334,6 +334,7 @@ pub mod fake {
     /// answers it. Every command is recorded, matched or not.
     #[derive(Default)]
     pub struct FakeRunner {
+        #[allow(clippy::type_complexity)]
         rules: RefCell<Vec<(Matcher, Box<dyn Fn(&Cmd) -> Result<Output>>)>>,
         pub calls: RefCell<Vec<Cmd>>,
         /// (socket, request line) of every socket request.

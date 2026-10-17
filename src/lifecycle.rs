@@ -110,13 +110,13 @@ pub fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
 /// worktree, branch or pull request.
 pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    if !force {
-        if let Some(view) = threads::session_view(ctx, &project) {
-            let alive = alive_panes(&project, &view);
-            if !alive.is_empty() {
-                let list: Vec<String> = alive.iter().map(|(what, pane, _)| format!("{what} (pane {pane})")).collect();
-                bail!("`{slug}` still has live panes: {}. Close them, or pass --force.", list.join(", "));
-            }
+    if !force
+        && let Some(view) = threads::session_view(ctx, &project)
+    {
+        let alive = alive_panes(&project, &view);
+        if !alive.is_empty() {
+            let list: Vec<String> = alive.iter().map(|(what, pane, _)| format!("{what} (pane {pane})")).collect();
+            bail!("`{slug}` still has live panes: {}. Close them, or pass --force.", list.join(", "));
         }
     }
     let threads = thread::list(&project);

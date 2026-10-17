@@ -765,10 +765,7 @@ pub fn run() -> Result<()> {
         Command::Popup { slug } => {
             let scope = match slug {
                 Some(slug) => Some(slug),
-                None => match overview::resolve_slug_quiet(&ctx) {
-                    Some(slug) => Some(slug),
-                    None => None,
-                },
+                None => overview::resolve_slug_quiet(&ctx),
             };
             let workspace = ctx.env.var("HERDR_WORKSPACE_ID").unwrap_or("").to_string();
             crate::popup::run(&ctx, scope, workspace)

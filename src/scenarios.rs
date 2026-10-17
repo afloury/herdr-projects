@@ -1860,7 +1860,7 @@ fn open_starts_a_coordinator_without_a_priming_prompt_then_focuses_it_and_resume
     *world.panes.borrow_mut() = "[]".into();
     crate::coordinator::open(&ctx, "demo", &options(false)).unwrap();
     let calls = world.runner.calls.borrow();
-    let start = calls.iter().filter(|c| c.display().contains("agent start")).last().unwrap();
+    let start = calls.iter().rfind(|c| c.display().contains("agent start")).unwrap();
     assert!(start.args.ends_with(&["--".to_string(), "--resume".to_string(), "sess-42".to_string()]), "{}", start.display());
     drop(calls);
 
@@ -1871,7 +1871,7 @@ fn open_starts_a_coordinator_without_a_priming_prompt_then_focuses_it_and_resume
     let another = crate::coordinator::OpenOptions { profile: Some("codex".into()), ..options(true) };
     crate::coordinator::open(&ctx, "demo", &another).unwrap();
     let calls = world.runner.calls.borrow();
-    let start = calls.iter().filter(|c| c.display().contains("agent start")).last().unwrap();
+    let start = calls.iter().rfind(|c| c.display().contains("agent start")).unwrap();
     assert!(start.display().starts_with("herdr agent start hpc-demo-1 --kind codex --pane w3:p2"), "{}", start.display());
     assert!(!start.display().contains("sess-42"));
     drop(calls);
@@ -1908,7 +1908,7 @@ fn open_new_starts_a_fresh_coordinator_beside_a_live_one_without_its_session() {
     world.runner.on("--pane w3:p2", ok(r#"{"result":{"agent":{"pane_id":"w3:p2","tab_id":"w3:t2","workspace_id":"w3","name":"hpc-demo-1","agent":"claude","agent_status":"idle"}}}"#));
     crate::coordinator::open(&ctx, "demo", &options(true)).unwrap();
     let calls = world.runner.calls.borrow();
-    let start = calls.iter().filter(|c| c.display().contains("agent start")).last().unwrap();
+    let start = calls.iter().rfind(|c| c.display().contains("agent start")).unwrap();
     assert!(start.display().starts_with("herdr agent start hpc-demo-1 --kind claude --pane w3:p2"), "{}", start.display());
     assert!(!start.display().contains("--resume") && !start.display().contains("sess-42"), "{}", start.display());
     drop(calls);
@@ -2014,7 +2014,7 @@ fn a_tab_thread_gets_a_brief_with_the_project_header_and_prompts_are_recorded() 
     std::fs::write(thread::home_report_path(&project, "t-0001"), "## Report\nok\n## Next\n- Open the PR\n").unwrap();
     threads::next(&ctx, "demo", "t-0001", Some(1), None).unwrap();
     let calls = world.runner.calls.borrow();
-    let last = calls.iter().filter(|c| c.display().contains("agent prompt")).last().unwrap();
+    let last = calls.iter().rfind(|c| c.display().contains("agent prompt")).unwrap();
     assert_eq!(prompt_text(last), "Open the PR");
     drop(calls);
     assert!(threads::next(&ctx, "demo", "t-0001", Some(3), None).is_err());
@@ -2196,6 +2196,7 @@ fn open_makes_a_tab_outside_a_shell_pane_from_the_popup_with_tab_or_from_an_agen
     let socket = |h: &Here| h.socket.to_string_lossy().into_owned();
     // Not inside Herdr, --tab, the popup (a plugin pane), another session's
     // pane, and a pane an agent occupies: all make a tab and run nothing here.
+    #[allow(clippy::type_complexity)]
     let cases: Vec<(&str, Box<dyn Fn(&Here) -> (Env, bool)>)> = vec![
         ("outside herdr", Box::new(|h| (Env::for_test(h.world.home.path(), &[]), true))),
         ("--tab", Box::new(|h| (h.world.env.clone(), false))),
@@ -2227,7 +2228,7 @@ fn a_tab_thread_of_a_coordinator_running_in_another_workspace_opens_the_project_
     let args = |title: &str| StartArgs { title: title.into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() };
     let t = threads::start(&h.world.ctx(), "demo", args("Research")).unwrap();
     let calls = h.world.runner.calls.borrow();
-    let create = calls.iter().filter(|c| c.display().contains("workspace create")).last().unwrap();
+    let create = calls.iter().rfind(|c| c.display().contains("workspace create")).unwrap();
     assert!(create.display().contains("threads/t-0001") && create.args.contains(&"Demo\u{2800}".to_string()), "{}", create.display());
     drop(calls);
     // (`Here` scripts every new workspace as w3.)
